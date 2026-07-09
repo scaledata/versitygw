@@ -22,6 +22,14 @@ import (
 	"github.com/versity/versitygw/s3response"
 )
 
+// chooseMPUHandler returns the right MPUHandler for the given configuration.
+func chooseMPUHandler(sameDirTmp bool) MPUHandler {
+	if sameDirTmp {
+		return Af2MPUHandler{}
+	}
+	return StandardMPUHandler{}
+}
+
 // MPUHandler abstracts the multipart upload write strategy for a Posix backend.
 // The standard implementation stages one file per part and concatenates at
 // Complete. Alternative implementations can plug in different strategies — for
@@ -34,6 +42,10 @@ import (
 // implementations live in this package, so the *Posix parameter does not
 // create an import cycle.
 type MPUHandler interface {
+	// CreateMultipartUpload initialises per-upload state after the common
+	// directory setup. acquireActionSlot is handled by Posix.CreateMultipartUpload.
+	CreateMultipartUpload(ctx context.Context, p *Posix, mpu s3response.CreateMultipartUploadInput, bucket, object, uploadID string) (s3response.InitiateMultipartUploadResult, error)
+
 	// UploadPart handles the write side of a part upload.
 	// acquireActionSlot is handled by Posix.UploadPart before calling this.
 	UploadPart(ctx context.Context, p *Posix, input *s3.UploadPartInput) (*s3.UploadPartOutput, error)
@@ -54,6 +66,10 @@ type MPUHandler interface {
 // StandardMPUHandler is the default MPUHandler for a generic POSIX filesystem.
 // It delegates to the existing Posix staging-and-concat methods unchanged.
 type StandardMPUHandler struct{}
+
+func (StandardMPUHandler) CreateMultipartUpload(_ context.Context, _ *Posix, _ s3response.CreateMultipartUploadInput, bucket, object, uploadID string) (s3response.InitiateMultipartUploadResult, error) {
+	return s3response.InitiateMultipartUploadResult{Bucket: bucket, Key: object, UploadId: uploadID}, nil
+}
 
 func (StandardMPUHandler) UploadPart(ctx context.Context, p *Posix, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
 	return p.UploadPartWithPostFunc(ctx, input, func(*os.File) error { return nil })
