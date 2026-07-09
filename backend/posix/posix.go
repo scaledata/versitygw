@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -92,6 +93,14 @@ type Posix struct {
 	// implementation can be supplied at construction to change the multipart
 	// write path without touching the S3 verb handlers.
 	mpuHandler MPUHandler
+
+	// mpuLocks holds one *sync.Mutex per in-flight Af2MPUHandler uploadID.
+	// Only populated when mpuHandler is Af2MPUHandler.
+	mpuLocks sync.Map
+
+	// lastRevealKind records which CompleteMultipartUpload reveal branch the
+	// Af2MPUHandler last took. Test-only observability field.
+	lastRevealKind revealKind
 
 	// sameDirTmp creates the temp file used for atomic object writes in
 	// the SAME directory as the final object (instead of a per-bucket
@@ -266,7 +275,7 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		bucketlinks:          opts.BucketLinks,
 		versioningDir:        versioningdirAbs,
 		newDirPerm:           opts.NewDirPerm,
-		mpuHandler:           StandardMPUHandler{},
+		mpuHandler:           chooseMPUHandler(opts.SameDirTmp),
 		forceNoTmpFile:       opts.ForceNoTmpFile,
 		forceNoCopyFileRange: opts.ForceNoCopyFileRange,
 		sameDirTmp:           opts.SameDirTmp,
@@ -1741,11 +1750,7 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 		}
 	}
 
-	return s3response.InitiateMultipartUploadResult{
-		Bucket:   bucket,
-		Key:      object,
-		UploadId: uploadID,
-	}, nil
+	return p.mpuHandler.CreateMultipartUpload(ctx, p, mpu, bucket, object, uploadID)
 }
 
 // getChownIDs returns the uid and gid that should be used for chowning
@@ -2846,11 +2851,10 @@ func (p *Posix) ListMultipartUploads(ctx context.Context, mpu *s3.ListMultipartU
 			continue
 		}
 
-		b, err := p.meta.RetrieveAttribute(nil, bucket, filepath.Join(MetaTmpMultipartDir, obj.Name()), onameAttr)
+		objectName, err := p.readMpObjName(bucket, obj.Name())
 		if err != nil {
 			continue
 		}
-		objectName := string(b)
 		// filter by prefix
 		if prefix != "" && !strings.HasPrefix(objectName, prefix) {
 			continue
