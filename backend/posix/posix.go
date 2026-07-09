@@ -87,6 +87,17 @@ type Posix struct {
 	// support copy_file_range is mounted over NFSv4.2.
 	forceNoCopyFileRange bool
 
+	// sameDirTmp creates the temp file used for atomic object writes in
+	// the SAME directory as the final object (instead of a per-bucket
+	// .sgwtmp staging subdir), so that the commit rename/link is always
+	// same-directory. This is required for filesystems that reject
+	// cross-directory rename (e.g. Rubrik SDFS, which returns EACCES on
+	// rename across directories). Atomicity is preserved: the write still
+	// lands in a temp file that is renamed into place as the single commit
+	// step. The temp file is given a hidden ".sgwtmp." prefix so it is
+	// excluded from object listings (see shouldSkip in backend/walk.go).
+	sameDirTmp bool
+
 	// enable posix level bucket name validations, not needed if the
 	// frontend handlers are already validating bucket names
 	validateBucketName bool
@@ -186,6 +197,10 @@ type PosixOpts struct {
 	// threshold are rejected with an 'InvalidRequest' error. Defaults to the
 	// S3 specification limit of 5 GiB.
 	CopyObjectThreshold int64
+	// SameDirTmp creates the atomic-write temp file in the object's own
+	// directory so the commit rename is same-directory. Required for
+	// filesystems that reject cross-directory rename (e.g. SDFS).
+	SameDirTmp bool
 }
 
 func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, error) {
@@ -247,6 +262,7 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		newDirPerm:           opts.NewDirPerm,
 		forceNoTmpFile:       opts.ForceNoTmpFile,
 		forceNoCopyFileRange: opts.ForceNoCopyFileRange,
+		sameDirTmp:           opts.SameDirTmp,
 		validateBucketName:   opts.ValidateBucketNames,
 		actionLimiter:        semaphore.NewWeighted(int64(concurrencyOrDefault(opts.Concurrency))),
 		copyObjectThreshold:  opts.CopyObjectThreshold,
@@ -259,6 +275,43 @@ func concurrencyOrDefault(n int) int {
 		return n
 	}
 	return defaultConcurrency
+}
+
+// tmpDir returns the directory in which to create the temp file used for an
+// atomic write of obj, for callers whose legacy staging dir is the per-bucket
+// .sgwtmp directory (e.g. PutObject). See tmpDirFor for the general form.
+func (p *Posix) tmpDir(bucket, obj string) string {
+	return p.tmpDirFor(filepath.Join(bucket, MetaTmpDir), bucket, obj)
+}
+
+// tmpDirFor returns the directory in which to create the atomic-write temp
+// file, given the caller's legacy staging dir and the final object's path
+// (relative to the gateway root). In sameDirTmp mode it returns the final
+// object's own parent directory, so the commit rename/link is same-directory
+// (required for filesystems such as SDFS that reject cross-directory rename).
+// Otherwise it returns legacyDir unchanged, preserving stock behavior. The
+// multipart paths stage temps in a deeper dir than the simple PUT path, which
+// is why the legacy dir is an explicit argument rather than always .sgwtmp.
+func (p *Posix) tmpDirFor(legacyDir, bucket, finalObj string) string {
+	if p.sameDirTmp {
+		return filepath.Dir(filepath.Join(bucket, finalObj))
+	}
+	return legacyDir
+}
+
+// tmpFilePrefix returns the os.CreateTemp name prefix for obj's temp file. In
+// sameDirTmp mode the temp file lives next to real objects, so it is given a
+// hidden ".sgwtmp." prefix to keep it out of object listings (see shouldSkip
+// in backend/walk.go). Otherwise it keeps the legacy hash-only prefix. The
+// object-name hash keeps temp names from colliding across concurrent uploads
+// of different keys; os.CreateTemp's random suffix handles same-key concurrency.
+func (p *Posix) tmpFilePrefix(obj string) string {
+	h := sha256.Sum256([]byte(obj))
+	if p.sameDirTmp {
+		// MetaTmpDir already begins with a dot, so this yields ".sgwtmp.<hash>."
+		return fmt.Sprintf("%s.%x.", MetaTmpDir, h)
+	}
+	return fmt.Sprintf("%x.", h)
 }
 
 func validateSubDir(root, dir string) (string, error) {
@@ -935,7 +988,7 @@ func (p *Posix) createObjVersion(bucket, key string, size int64, acc auth.Accoun
 	versionBucketPath := filepath.Join(p.versioningDir, bucket)
 	versioningKey := filepath.Join(genObjVersionKey(key), versionId)
 	versionTmpPath := filepath.Join(versionBucketPath, MetaTmpDir)
-	f, err := p.openTmpFile(versionTmpPath, versionBucketPath, versioningKey,
+	f, err := p.openTmpFile(p.tmpDirFor(versionTmpPath, versionBucketPath, versioningKey), versionBucketPath, versioningKey,
 		size, acc, doFalloc, p.forceNoTmpFile)
 	if err != nil {
 		return versionPath, err
@@ -2082,7 +2135,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		}
 	}
 
-	f, err := p.openTmpFile(filepath.Join(bucket, MetaTmpDir), bucket, object,
+	f, err := p.openTmpFile(p.tmpDirFor(filepath.Join(bucket, MetaTmpDir), bucket, object), bucket, object,
 		totalsize, acct, skipFalloc, p.forceNoTmpFile)
 	if err != nil {
 		if errors.Is(err, syscall.EDQUOT) {
@@ -3020,7 +3073,7 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 
 	partPath := filepath.Join(mpPath, fmt.Sprintf("%v", *part))
 
-	f, err := p.openTmpFile(filepath.Join(bucket, objdir),
+	f, err := p.openTmpFile(p.tmpDirFor(filepath.Join(bucket, objdir), bucket, partPath),
 		bucket, partPath, length, acct, doFalloc, p.forceNoTmpFile)
 	if err != nil {
 		if errors.Is(err, syscall.EDQUOT) {
@@ -3405,7 +3458,7 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		return s3response.CopyPartResult{}, err
 	}
 
-	f, err := p.openTmpFile(filepath.Join(*upi.Bucket, objdir),
+	f, err := p.openTmpFile(p.tmpDirFor(filepath.Join(*upi.Bucket, objdir), *upi.Bucket, partPath),
 		*upi.Bucket, partPath, length, acct, doFalloc, p.forceNoTmpFile)
 	if err != nil {
 		if errors.Is(err, syscall.EDQUOT) {
@@ -3793,7 +3846,7 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 		return s3response.PutObjectOutput{}, fmt.Errorf("stat object: %w", err)
 	}
 
-	f, err := p.openTmpFile(filepath.Join(*po.Bucket, MetaTmpDir),
+	f, err := p.openTmpFile(p.tmpDir(*po.Bucket, *po.Key),
 		*po.Bucket, *po.Key, contentLength, acct, doFalloc, p.forceNoTmpFile)
 	if err != nil {
 		if errors.Is(err, syscall.EDQUOT) {
@@ -4217,7 +4270,7 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 					acct = auth.Account{}
 				}
 
-				f, err := p.openTmpFile(filepath.Join(bucket, MetaTmpDir),
+				f, err := p.openTmpFile(p.tmpDirFor(filepath.Join(bucket, MetaTmpDir), bucket, object),
 					bucket, object, srcObjVersion.Size(), acct, doFalloc,
 					p.forceNoTmpFile)
 				if err != nil {

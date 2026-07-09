@@ -33,6 +33,7 @@ var (
 	nometa               bool
 	forceNoTmpFile       bool
 	forceNoCopyFileRange bool
+	sameDirTmp           bool
 	actionsConcurrency   int
 )
 
@@ -115,6 +116,12 @@ will be translated into the file /mnt/fs/gwroot/mybucket/a/b/c/myobject`,
 				EnvVars:     []string{"VGW_DISABLE_COPY_FILE_RANGE"},
 				Destination: &forceNoCopyFileRange,
 			},
+			&cli.BoolFlag{
+				Name:        "same-dir-tmp",
+				Usage:       "create the atomic-write temp file in the object's own directory so the commit rename is same-directory; required for filesystems that reject cross-directory rename (e.g. SDFS). Use with --disableotmp on such filesystems.",
+				EnvVars:     []string{"VGW_SAME_DIR_TMP"},
+				Destination: &sameDirTmp,
+			},
 		},
 	}
 }
@@ -146,6 +153,7 @@ func runPosix(ctx *cli.Context) error {
 		NewDirPerm:           fs.FileMode(dirPerms),
 		ForceNoTmpFile:       forceNoTmpFile,
 		ForceNoCopyFileRange: forceNoCopyFileRange,
+		SameDirTmp:           sameDirTmp,
 		ValidateBucketNames:  disableStrictBucketNames,
 		Concurrency:          actionsConcurrency,
 		CopyObjectThreshold:  copyObjectThreshold,
