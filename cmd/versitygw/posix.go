@@ -31,6 +31,8 @@ var (
 	dirPerms             uint
 	sidecar              string
 	nometa               bool
+	af2Desc              bool
+	af2DescMaxBytes      int
 	forceNoTmpFile       bool
 	forceNoCopyFileRange bool
 	sameDirTmp           bool
@@ -117,6 +119,19 @@ will be translated into the file /mnt/fs/gwroot/mybucket/a/b/c/myobject`,
 				Destination: &forceNoCopyFileRange,
 			},
 			&cli.BoolFlag{
+				Name:        "af2-desc",
+				Usage:       "store S3 object metadata (etag, content-type, user metadata) in the single AF2 DESC file attribute so it rides the AF2 snapshot; for CDM SDFS. Mutually exclusive with --sidecar and --nometa.",
+				EnvVars:     []string{"VGW_AF2_DESC"},
+				Destination: &af2Desc,
+			},
+			&cli.IntFlag{
+				Name:        "af2-desc-max-bytes",
+				Usage:       "maximum size of the packed AF2 DESC metadata blob (MJF attribute value cap)",
+				EnvVars:     []string{"VGW_AF2_DESC_MAX_BYTES"},
+				Value:       meta.DefaultDescMaxBytes,
+				Destination: &af2DescMaxBytes,
+			},
+			&cli.BoolFlag{
 				Name:        "same-dir-tmp",
 				Usage:       "create the atomic-write temp file in the object's own directory so the commit rename is same-directory; required for filesystems that reject cross-directory rename (e.g. SDFS). Use with --disableotmp on such filesystems.",
 				EnvVars:     []string{"VGW_SAME_DIR_TMP"},
@@ -141,6 +156,10 @@ func runPosix(ctx *cli.Context) error {
 		return fmt.Errorf("cannot use both nometa and sidecar metadata")
 	}
 
+	if af2Desc && (sidecar != "" || nometa) {
+		return fmt.Errorf("cannot combine af2-desc with sidecar or nometa metadata")
+	}
+
 	if actionsConcurrency <= 0 {
 		return fmt.Errorf("concurrency must be positive, got %d", actionsConcurrency)
 	}
@@ -161,6 +180,8 @@ func runPosix(ctx *cli.Context) error {
 
 	var ms meta.MetadataStorer
 	switch {
+	case af2Desc:
+		ms = meta.NewAf2Desc(af2DescMaxBytes)
 	case sidecar != "":
 		sc, err := meta.NewSideCar(sidecar)
 		if err != nil {
