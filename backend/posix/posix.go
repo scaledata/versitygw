@@ -3701,7 +3701,7 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 	}
 	defer release()
 
-	return p.PutObjectWithPostFunc(ctx, po, func(*os.File) error { return nil })
+	return p.PutObjectWithPostFunc(ctx, po, func(f *os.File) error { return f.Sync() })
 }
 
 func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObjectInput, postprocess func(f *os.File) error) (s3response.PutObjectOutput, error) {
