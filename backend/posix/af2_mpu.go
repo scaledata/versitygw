@@ -67,6 +67,7 @@ type otterMpuPart struct {
 	Offset      int64  `json:"off"`             // final data-file offset; valid only when Stashed==false
 	Len         int64  `json:"len"`             // true written length (never the declared/stride length)
 	ETag        string `json:"etag"`
+	CRC         string `json:"crc,omitempty"`   // part CRC64NVME recorded at UploadPart, for O(1) full-object CRC at Complete
 	Stashed     bool   `json:"stash,omitempty"` // true => bytes live in the stash file at StashOffset
 	StashOffset int64  `json:"soff,omitempty"`  // byte offset within the .stash file (valid iff Stashed)
 }
@@ -192,25 +193,33 @@ func readMpIndex(path string) (*otterMpuIndex, error) {
 	return &idx, nil
 }
 
-// writeAtomic writes b to a UNIQUE same-directory temp file and renames it onto
-// path. The rename is what makes the swap atomic — a reader (or a retry) sees
-// either the old contents or the complete new ones, never a torn write.
-//
-// It deliberately does NOT fsync. Otter is ack-on-write and the durability
-// boundary is the AF2 checkpoint, not the gateway (design §8): a 200 means "in
-// the channel," not "survives a power loss." fsync'ing in-progress MPU staging
-// would hold it to a stronger guarantee than finished objects get (the final
-// reveal rename isn't fsync'd either) — at exactly the fsync cost that wedges
-// SDFS. Crash-consistency here comes from this rename plus the per-part MD5
-// re-validation at Complete, not from fsync. A unique tmp name (pid + nanos)
-// avoids the fixed-".tmp" collision under concurrent retries.
-func writeAtomic(path string, b []byte) error {
+// fsyncParentDir opens the parent directory of path and fsyncs it so a rename
+// into (or unlink from) that directory is durable.
+func fsyncParentDir(path string) error {
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// writeDurableAtomic writes b to a UNIQUE same-directory temp file, fsyncs the
+// temp fd, renames it onto path, then fsyncs the parent dir so both the bytes
+// and the rename survive a crash. A unique tmp name (pid + nanos) avoids the
+// fixed-".tmp" collision under concurrent retries.
+func writeDurableAtomic(path string, b []byte) error {
 	tmp := path + "." + strconv.Itoa(os.Getpid()) + "." + strconv.FormatInt(time.Now().UnixNano(), 10) + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
 	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -223,30 +232,29 @@ func writeAtomic(path string, b []byte) error {
 		os.Remove(tmp)
 		return err
 	}
-	return nil
+	return fsyncParentDir(path)
 }
 
-// writeMpIndexAtomic commits the index via an atomic temp+rename so a reader or a
-// retry never sees a half-written index. It is not fsync'd (see writeAtomic): the
-// index is rebuilt by client retries and every part is re-validated at Complete,
-// so it needs consistency, not durability.
+// writeMpIndexAtomic writes the index durably (unique temp, fsync temp + parent
+// dir, rename) so a crash never leaves a half-written or non-durable index. The
+// crash-safety ordering (bytes+fsync precede the index commit) depends on this
+// actually reaching stable storage.
 func writeMpIndexAtomic(path string, idx *otterMpuIndex) error {
 	b, err := json.Marshal(idx)
 	if err != nil {
 		return fmt.Errorf("marshal mpu index: %w", err)
 	}
-	return writeAtomic(path, b)
+	return writeDurableAtomic(path, b)
 }
 
-// writeMpUploadMeta persists the upload's object metadata as a plain JSON file via
-// an atomic temp+rename (not fsync'd; readMpUploadMeta is best-effort and a failed
-// Create is retried by the client).
+// writeMpUploadMeta persists the upload's object metadata as a plain JSON file,
+// durably (so a crash at Create does not silently lose the upload metadata).
 func writeMpUploadMeta(path string, m metaProperties) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("marshal mpu upload-meta: %w", err)
 	}
-	return writeAtomic(path, b)
+	return writeDurableAtomic(path, b)
 }
 
 // readMpUploadMeta reads the upload's object metadata plain file.
@@ -461,6 +469,14 @@ func (p *Posix) uploadPartAtOffset(bucket, object, uploadID string, partNum int,
 	hash := md5.New()
 	tr := io.TeeReader(input.Body, hash)
 
+	// Compute the part's CRC64NVME as it streams, so CompleteMultipartUpload can
+	// accumulate the full-object checksum from the index with no data re-read.
+	crcRdr, err := utils.NewHashReader(tr, "", utils.HashTypeCRC64NVME)
+	if err != nil {
+		return nil, fmt.Errorf("init part crc reader: %w", err)
+	}
+	tr = crcRdr
+
 	chAlgo, chVal := userPartChecksum(input)
 	var hashRdr *utils.HashReader
 	if chAlgo != "" {
@@ -482,9 +498,15 @@ func (p *Posix) uploadPartAtOffset(bucket, object, uploadID string, partNum int,
 		return nil, fmt.Errorf("write part data: %w", err)
 	}
 
-	etag := backend.GenerateEtag(hash)
+	// Crash-safety invariant: the part bytes are durable before its index record names them.
+	if err := tf.Sync(); err != nil {
+		return nil, fmt.Errorf("fsync mpu part file: %w", err)
+	}
 
-	rec := otterMpuPart{PartNumber: partNum, Len: written, ETag: etag}
+	etag := backend.GenerateEtag(hash)
+	partCRC := crcRdr.Sum()
+
+	rec := otterMpuPart{PartNumber: partNum, Len: written, ETag: etag, CRC: partCRC}
 	switch disp {
 	case dispPlace:
 		rec.Offset = offset
@@ -677,6 +699,11 @@ func (p *Posix) completeMultipartAtOffset(input *s3.CompleteMultipartUploadInput
 				sf.Close()
 				return res, "", fmt.Errorf("fold stashed part: %w", err)
 			}
+			if err := df.Sync(); err != nil {
+				df.Close()
+				sf.Close()
+				return res, "", fmt.Errorf("fsync folded data file: %w", err)
+			}
 			idx.Parts[ri].Stashed = false
 			idx.Parts[ri].Offset = finalOff
 			idx.Parts[ri].StashOffset = 0
@@ -690,11 +717,9 @@ func (p *Posix) completeMultipartAtOffset(input *s3.CompleteMultipartUploadInput
 		sf.Close()
 	}
 
-	// Folds done: drop stray bytes beyond the parts' extent. dataSize is the parts'
-	// max committed extent, NOT the raw file size, so leftover stash/scratch bytes
-	// can never neuter the crash guard. The stash file is left in place until the
-	// post-reveal cleanup (validateRevealMpu), so a crash before reveal can still
-	// re-fold from it.
+	// All folds durable: drop stray bytes beyond the parts' extent and remove the
+	// stash. dataSize is the parts' max committed extent, NOT the raw file size,
+	// so leftover stash/scratch bytes can never neuter the crash guard.
 	var dataSize int64
 	for _, part := range parts {
 		if rec, _ := idx.find(int(*part.PartNumber)); rec != nil {
@@ -706,6 +731,7 @@ func (p *Posix) completeMultipartAtOffset(input *s3.CompleteMultipartUploadInput
 	if err := os.Truncate(dataPath, dataSize); err != nil {
 		return res, "", fmt.Errorf("truncate mpu data file: %w", err)
 	}
+	os.Remove(stashPath)
 
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0755); err != nil {
 		return res, "", fmt.Errorf("create object dir: %w", err)
@@ -814,24 +840,21 @@ func (p *Posix) validateRevealMpu(input *s3.CompleteMultipartUploadInput, srcPat
 			return res, "", s3err.GetEntityTooSmallErr(rec.Len, backend.MinPartSize)
 		}
 
-		md5sum, err := recomputePartMD5(df, rec.Offset, rec.Len)
-		if err != nil {
-			df.Close()
-			return res, "", fmt.Errorf("recompute part md5: %w", err)
-		}
-		if !backend.AreEtagsSame(rec.ETag, *part.ETag) || !backend.AreEtagsSame(md5sum, *part.ETag) {
+		// Verify the client's claimed ETag against the ETag recorded at UploadPart.
+		// No data re-read: the part's bytes were MD5'd when written (rec.ETag), and
+		// their durability is the storage layer's job (fsync at UploadPart). This
+		// replaces the former per-part re-hash of the whole object, which dominated
+		// Complete latency (a full second pass over the data).
+		if !backend.AreEtagsSame(rec.ETag, *part.ETag) {
 			df.Close()
 			return res, "", s3err.GetInvalidPartErr(uploadID, *part.PartNumber, *part.ETag)
 		}
 
-		pc, err := recomputePartCRC64NVME(df, rec.Offset, rec.Len)
-		if err != nil {
-			df.Close()
-			return res, "", fmt.Errorf("recompute part crc: %w", err)
-		}
+		// Accumulate the full-object CRC64NVME from the per-part CRCs recorded at
+		// UploadPart (rec.CRC) — again with no data read.
 		if i == 0 {
-			crc = pc
-		} else if crc, err = utils.AddCRCChecksum(types.ChecksumAlgorithmCrc64nvme, crc, pc, rec.Len); err != nil {
+			crc = rec.CRC
+		} else if crc, err = utils.AddCRCChecksum(types.ChecksumAlgorithmCrc64nvme, crc, rec.CRC, rec.Len); err != nil {
 			df.Close()
 			return res, "", fmt.Errorf("accumulate crc: %w", err)
 		}
