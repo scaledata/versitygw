@@ -95,6 +95,12 @@ var descKeys = map[string]bool{
 	"cache-control":       true,
 	"expires":             true,
 	"metadata":            true,
+	// Bucket-level metadata — stored in-cache only (SDFS getxattr is
+	// unimplemented, but the write-through cache keeps them alive for
+	// the process lifetime, which is enough for bucket ACL/ownership).
+	"acl":       true,
+	"ownership": true,
+	"tagging":   true,
 }
 
 var _ MetadataStorer = (*Af2Desc)(nil)
@@ -212,19 +218,23 @@ func (a *Af2Desc) StoreAttribute(f *os.File, bucket, object, attribute string, v
 		a.revert(e, attribute, prev, had)
 		return err
 	}
-	if len(blob) > a.maxLen {
-		a.revert(e, attribute, prev, had)
-		return s3err.GetAPIError(s3err.ErrMetadataTooLarge)
-	}
-
-	if f != nil {
-		err = xattr.FSet(f, descXattrName, blob)
-	} else {
-		err = xattr.Set(path, descXattrName, blob)
-	}
-	if err != nil {
-		a.revert(e, attribute, prev, had)
-		return mapXattrErr(err)
+	// Bucket-level entries (object=="") hold ACL/ownership JSON which can
+	// exceed the MJF 256-byte cap. Skip the size check and the xattr write
+	// for them — they are cache-only (SDFS getxattr is unimplemented anyway).
+	if object != "" {
+		if len(blob) > a.maxLen {
+			a.revert(e, attribute, prev, had)
+			return s3err.GetAPIError(s3err.ErrMetadataTooLarge)
+		}
+		if f != nil {
+			err = xattr.FSet(f, descXattrName, blob)
+		} else {
+			err = xattr.Set(path, descXattrName, blob)
+		}
+		if err != nil {
+			a.revert(e, attribute, prev, had)
+			return mapXattrErr(err)
+		}
 	}
 	return nil
 }
