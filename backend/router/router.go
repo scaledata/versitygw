@@ -91,31 +91,66 @@ func (r *Router) pick(bucket, key string) (backend.Backend, bool) {
 
 // ---- placement -------------------------------------------------------------
 
-var walName = regexp.MustCompile(`^[0-9A-Fa-f]{24}$`)
+var (
+	walName    = regexp.MustCompile(`^[0-9A-Fa-f]{24}$`)
+	relSegment = regexp.MustCompile(`^(\d+)(?:\.(\d+))?$`)
+)
 
-// place maps an object to a slot in [0,n). WAL segment names (24 hex chars) are
-// monotonic, so we place by their low-64-bit ordinal mod n: consecutive
-// segments land on distinct slots (round-robin-like, and recomputable on read).
-// Everything else uses fnv-1a(bucket+"/"+key) mod n. Deterministic and stable —
-// the read path recomputes the same slot with no location map. N and the
-// ordering must stay frozen for the data's retention life.
+// place maps an object to a slot in [0,n). Three cases:
+//
+//  1. WAL segment names (24 hex chars, e.g. 000000010000000000000001):
+//     route by their low-64-bit ordinal mod n so consecutive segments
+//     round-robin across slots.
+//
+//  2. Postgres relation segment files (numeric OID, optional .N suffix, e.g.
+//     base/16384/1259.42): route by (hash(dir+oid) + segNum) mod n so every
+//     segment of the same relation distributes evenly — a 127 GB table (127
+//     × 1 GB segments) spreads exactly 31-32 segments per channel regardless
+//     of n, and is recomputable on read with no location map.
+//
+//  3. Everything else: fnv-1a(bucket+"/"+key) mod n.
+//
+// All three are deterministic and stable — the read path recomputes the same
+// slot. N and the ordering must stay frozen for the data's retention life.
 func place(bucket, key string, n int) int {
 	if n <= 1 {
 		return 0
 	}
+
+	// base = last path component; dir = everything before it
 	base := key
+	dir := bucket
 	for i := len(key) - 1; i >= 0; i-- {
 		if key[i] == '/' {
 			base = key[i+1:]
+			dir = bucket + "/" + key[:i]
 			break
 		}
 	}
+
+	// Case 1: WAL segment (24 hex chars)
 	if walName.MatchString(base) {
-		// last 16 hex chars = (logid<<32 | seg); increments by 1 per segment
 		if ord, err := strconv.ParseUint(base[8:], 16, 64); err == nil {
 			return int(ord % uint64(n))
 		}
 	}
+
+	// Case 2: Postgres relation file — OID with optional .segNum suffix.
+	// Examples: "1259", "1259.1", "1259.42"
+	// Hash the (dir+OID) pair to pick a base slot, then add the segment
+	// number so every segment of the same relation lands on a distinct slot.
+	if m := relSegment.FindStringSubmatch(base); m != nil {
+		segNum := 0
+		if m[2] != "" {
+			segNum, _ = strconv.Atoi(m[2])
+		}
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(dir + "/" + m[1]))
+		oidSlot := int(h.Sum64() % uint64(n))
+		return (oidSlot + segNum) % n
+	}
+
+	// Case 3: everything else (fsm, vm, init forks, config files, etc.)
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(bucket + "/" + key))
 	return int(h.Sum64() % uint64(n))
