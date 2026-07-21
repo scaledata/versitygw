@@ -140,6 +140,10 @@ func runOtter(ctx *cli.Context) error {
 		NewDirPerm:          fs.FileMode(dirPerms),
 		ForceNoTmpFile:      forceNoTmpFile,
 		SameDirTmp:          sameDirTmp,
+		// The otter deployment is the AF2 write-at-offset backend, so it selects
+		// the Af2 MPU handler explicitly. This is decoupled from SameDirTmp (which
+		// is only the cross-dir-rename fix) so the two concerns stay independent.
+		Af2MPU:              true,
 		ValidateBucketNames: disableStrictBucketNames,
 		Concurrency:         actionsConcurrency,
 		CopyObjectThreshold: copyObjectThreshold,
