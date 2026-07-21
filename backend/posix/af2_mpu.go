@@ -14,26 +14,33 @@
 
 package posix
 
-// Otter multipart write-at-offset support (LLD §4b).
+// Otter multipart write-at-offset support (LLD §4b) — complete-only-fsync model.
 //
-// Instead of staging one file per part and concatenating them into the final
-// object at Complete (a second full-size write, costly on AF2/SDFS), Otter
-// writes every part directly at its final byte offset in ONE data file and
-// reveals it with a same-directory rename at Complete — the data is written
-// once.
+// Each part is written directly at its final byte offset in ONE data file and
+// the object is revealed with a same-directory rename at Complete, so the data
+// is written once. Under the whole-object-retry crash contract, per-part
+// durability is not needed: parts are acked as they arrive but nothing is
+// fsync'd until Complete, when the assembled object's data is fsync'd once and
+// the reveal rename is made durable (parent-dir fsync). Any crash before that
+// single durability point loses only the hidden scratch file; the client
+// re-uploads the whole object.
 //
-// State layout (the upstream .sgwtmp tree is retained so ListMultipartUploads /
-// checkUploadIDExists keep working and a single skip rule hides it):
+// State:
+//   - The per-upload index (stride + placed part records + the pre-stride
+//     buffer) is IN-MEMORY, keyed by (bucket,object,uploadID) in p.mpuIndexes.
+//     It is not durable; a gateway restart drops it and the client retries.
+//   - CreateMultipartUpload still writes the on-disk state dir + objname +
+//     upload-meta, so checkUploadIDExists / ListMultipartUploads are unchanged.
+//   - <objdir>/.sgwtmp.<hash(key)>.<uploadID>.data  — the single data file.
+//   - <objdir>/.sgwtmp.<hash(key)>.<uploadID>.stash — a spill file, used ONLY
+//     when a pre-stride buffered part exceeds the in-memory cap (page-cache, no
+//     fsync). Common uploads never create it.
 //
-//	<bucket>/.sgwtmp/multipart/<hash(key)>/objname            (plain file: the S3 key)
-//	<bucket>/.sgwtmp/multipart/<hash(key)>/<uploadID>/        (per-upload state dir)
-//	<bucket>/.sgwtmp/multipart/<hash(key)>/<uploadID>/index   (plain JSON: parts + stride)
-//	<objdir>/.sgwtmp.<hash(key)>.<uploadID>.data             (the single data file)
-//
-// The data file lives in the object's OWN directory (so the reveal rename is
-// same-directory, legal on SDFS) and uses the ".sgwtmp." prefix so it is already
-// hidden by every listing walk. The index records each part's {offset,len,etag}
-// so Complete needs no stored per-part attribute and ListParts has full fidelity.
+// A part whose final offset is not yet known (it arrived before the stride was
+// resolvable) is held in the in-memory buffer (or spilled) and flushed to the
+// data file the instant the stride resolves. Because the stride resolves as soon
+// as part #1 or a second distinct part number is seen, at most one part is ever
+// buffered.
 
 import (
 	"context"
@@ -55,36 +62,70 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
 
-// otterMpuPart is one recorded part in the per-upload index.
-type otterMpuPart struct {
-	PartNumber  int    `json:"n"`
-	Offset      int64  `json:"off"`             // final data-file offset; valid only when Stashed==false
-	Len         int64  `json:"len"`             // true written length (never the declared/stride length)
-	ETag        string `json:"etag"`
-	CRC         string `json:"crc,omitempty"`   // part CRC64NVME recorded at UploadPart, for O(1) full-object CRC at Complete
-	Stashed     bool   `json:"stash,omitempty"` // true => bytes live in the stash file at StashOffset
-	StashOffset int64  `json:"soff,omitempty"`  // byte offset within the .stash file (valid iff Stashed)
+// applyFinalObjectPerms sets the revealed object's mode (and ownership when
+// chown is configured) on its fd before the reveal rename, matching the standard
+// posix path — otherwise Af2-completed objects would keep the in-progress data
+// file's 0600 mode owned by the gateway process. Directory ownership on this
+// path still follows the gateway process (the object's parent dir is created
+// lazily during UploadPart, before the account is known); that is acceptable for
+// the SDFS deployment (root; CDM consumes via AF2, not direct POSIX) and full
+// dir-chown parity is a follow-up if a POSIX-export use case needs it.
+func (p *Posix) applyFinalObjectPerms(f *os.File, acct auth.Account) error {
+	if err := f.Chmod(os.FileMode(defaultFilePerm)); err != nil {
+		return fmt.Errorf("chmod final object: %w", err)
+	}
+	if uid, gid, doChown := p.getChownIDs(acct); doChown {
+		if err := f.Chown(uid, gid); err != nil {
+			return fmt.Errorf("chown final object: %w", err)
+		}
+	}
+	return nil
 }
 
-// otterMpuIndex is the per-upload write-at-offset index, stored as a plain JSON
-// file in the upload's state dir.
+// otterMpuPart is one PLACED part (its bytes are already in the data file).
+type otterMpuPart struct {
+	PartNumber int
+	Offset     int64  // final data-file offset
+	Len        int64  // true written length (never the declared/stride length)
+	ETag       string // md5 ETag computed at UploadPart
+	CRC        string // part CRC32C computed at UploadPart, for O(1) full-object CRC at Complete
+}
+
+// pendingPart is a part received before its final offset was known. Its bytes
+// live in RAM (data != nil) or, if larger than the cap, in the per-upload spill
+// file (spilled == true). Hashes are computed on arrival so no re-read is needed.
+type pendingPart struct {
+	data     []byte // non-nil iff held in RAM
+	spilled  bool   // true iff bytes are in the spill file at spillOff
+	spillOff int64
+	length   int64
+	etag     string
+	crc      string
+}
+
+// otterMpuIndex is the per-upload write-at-offset index. It is IN-MEMORY only
+// (never serialized) under the complete-only-fsync model.
 type otterMpuIndex struct {
-	// Stride is the confirmed uniform part size S. It is set either from part #1
-	// (n==1, authoritative) OR, once two or more distinct part numbers have been
-	// seen, as the maximum of their lengths — safe because at most one part (the
-	// highest-numbered) may be short, so the larger of any two parts must be the
-	// full stride. Zero means S is not resolvable yet (only one distinct part,
-	// and not #1); S is then resolved at Complete from the authoritative ordered
-	// part list. A short part NEVER sets Stride on its own.
-	Stride    int64          `json:"stride"`
-	StashNext int64          `json:"snext,omitempty"` // bump cursor: next free offset in the .stash file
-	Parts     []otterMpuPart `json:"parts"`
+	// Stride is the confirmed uniform part size S (0 = not yet resolved). It is
+	// set from part #1 (authoritative) or, once two distinct part numbers are
+	// seen, as the max of their true lengths — at most one part (the last) may be
+	// short, so that max is S.
+	Stride int64
+	Parts  []otterMpuPart // placed parts only
+
+	// pending holds parts awaiting stride resolution. Invariant: at most one
+	// entry at a time (a re-upload of the same number overwrites the slot; the
+	// second distinct number resolves the stride and drains the buffer).
+	pending    map[int]*pendingPart
+	pendingRAM int64 // total bytes currently held in RAM across pending (cap accounting)
+	spillNext  int64 // append cursor into the per-upload spill file (disk fallback)
 }
 
 // --- naming helpers -------------------------------------------------------
@@ -110,11 +151,6 @@ func mpStateDir(bucket, key, uploadID string) string {
 	return filepath.Join(mpHashDir(bucket, key), uploadID)
 }
 
-// mpIndexPath is the per-upload index plain file.
-func mpIndexPath(bucket, key, uploadID string) string {
-	return filepath.Join(mpStateDir(bucket, key, uploadID), "index")
-}
-
 // mpUploadMetaPath is the per-upload object-metadata plain file (content-type,
 // user metadata) captured at Create and applied to the final object at Complete.
 // It is a plain file (not a DESC attribute) because the upload-id path is a
@@ -137,22 +173,15 @@ func mpDataFilePath(bucket, key, uploadID string) string {
 	return filepath.Join(objDir, mpDataFileName(key, uploadID))
 }
 
-// mpCompletingName is the claim marker the data file is renamed to at Complete.
-func mpCompletingPath(bucket, key, uploadID string) string {
-	return mpDataFilePath(bucket, key, uploadID) + ".completing"
-}
-
-// mpStashFileName is the per-upload stash file's basename. It mirrors
-// mpDataFileName (".sgwtmp." prefix so the listing skip rule hides it) but ends
-// in ".stash". Parts that cannot yet be placed at their final offset (they
-// arrived before the stride was resolvable, or are shorter than the confirmed
-// stride — the tail) are appended here and folded into the data file at Complete.
+// mpStashFileName is the per-upload spill file's basename (".sgwtmp." prefix so
+// the listing skip rule hides it, ".stash" suffix). Used only as a disk fallback
+// when a pre-stride buffered part exceeds the in-memory cap; written without
+// fsync and drained at stride resolution.
 func mpStashFileName(key, uploadID string) string {
 	return fmt.Sprintf("%s.%s.%s.stash", MetaTmpDir, mpKeyHash(key), uploadID)
 }
 
-// mpStashFilePath is the stash file in the object's own directory (so a fold /
-// rename stays same-directory, legal on SDFS).
+// mpStashFilePath is the spill file in the object's own directory.
 func mpStashFilePath(bucket, key, uploadID string) string {
 	objDir := filepath.Dir(filepath.Join(bucket, key))
 	return filepath.Join(objDir, mpStashFileName(key, uploadID))
@@ -160,7 +189,7 @@ func mpStashFilePath(bucket, key, uploadID string) string {
 
 // --- per-uploadID lock ----------------------------------------------------
 
-// mpuLock returns the *sync.Mutex serializing all index/data/stash mutations for
+// mpuLock returns the *sync.Mutex serializing all index/data/spill mutations for
 // a single (bucket, object, uploadID), creating it on first use via LoadOrStore.
 // The entry is removed by Complete/Abort on the terminal path (NOT inline on the
 // upload path, which would split mutual exclusion across two mutex objects while
@@ -179,19 +208,41 @@ func (p *Posix) mpuUnlockDelete(bucket, object, uploadID string) {
 	p.mpuLocks.Delete(key)
 }
 
-// --- index I/O ------------------------------------------------------------
+// --- in-memory index store ------------------------------------------------
 
-func readMpIndex(path string) (*otterMpuIndex, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var idx otterMpuIndex
-	if err := json.Unmarshal(b, &idx); err != nil {
-		return nil, fmt.Errorf("parse mpu index: %w", err)
-	}
-	return &idx, nil
+func mpuIndexKey(bucket, object, uploadID string) string {
+	return bucket + "\x00" + object + "\x00" + uploadID
 }
+
+// getMpuIndex returns the in-memory index for the uploadID, creating an empty
+// one if absent. The bool is false when a fresh index was created (first part of
+// the upload in this process), which the caller uses to drop any scratch left by
+// a prior attempt that reused this uploadID (e.g. across a gateway restart).
+// Callers must hold the per-uploadID mutex.
+func (p *Posix) getMpuIndex(bucket, object, uploadID string) (*otterMpuIndex, bool) {
+	k := mpuIndexKey(bucket, object, uploadID)
+	if v, ok := p.mpuIndexes.Load(k); ok {
+		return v.(*otterMpuIndex), true
+	}
+	idx := &otterMpuIndex{pending: make(map[int]*pendingPart)}
+	actual, loaded := p.mpuIndexes.LoadOrStore(k, idx)
+	return actual.(*otterMpuIndex), loaded
+}
+
+// peekMpuIndex returns the in-memory index without creating one.
+func (p *Posix) peekMpuIndex(bucket, object, uploadID string) (*otterMpuIndex, bool) {
+	if v, ok := p.mpuIndexes.Load(mpuIndexKey(bucket, object, uploadID)); ok {
+		return v.(*otterMpuIndex), true
+	}
+	return nil, false
+}
+
+// delMpuIndex drops the in-memory index (and, with it, any buffered bytes).
+func (p *Posix) delMpuIndex(bucket, object, uploadID string) {
+	p.mpuIndexes.Delete(mpuIndexKey(bucket, object, uploadID))
+}
+
+// --- durable helpers (Create-time upload-meta only) -----------------------
 
 // fsyncParentDir opens the parent directory of path and fsyncs it so a rename
 // into (or unlink from) that directory is durable.
@@ -206,8 +257,8 @@ func fsyncParentDir(path string) error {
 
 // writeDurableAtomic writes b to a UNIQUE same-directory temp file, fsyncs the
 // temp fd, renames it onto path, then fsyncs the parent dir so both the bytes
-// and the rename survive a crash. A unique tmp name (pid + nanos) avoids the
-// fixed-".tmp" collision under concurrent retries.
+// and the rename survive a crash. Used for the Create-time upload-meta (written
+// once, off the per-part hot path).
 func writeDurableAtomic(path string, b []byte) error {
 	tmp := path + "." + strconv.Itoa(os.Getpid()) + "." + strconv.FormatInt(time.Now().UnixNano(), 10) + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
@@ -235,18 +286,6 @@ func writeDurableAtomic(path string, b []byte) error {
 	return fsyncParentDir(path)
 }
 
-// writeMpIndexAtomic writes the index durably (unique temp, fsync temp + parent
-// dir, rename) so a crash never leaves a half-written or non-durable index. The
-// crash-safety ordering (bytes+fsync precede the index commit) depends on this
-// actually reaching stable storage.
-func writeMpIndexAtomic(path string, idx *otterMpuIndex) error {
-	b, err := json.Marshal(idx)
-	if err != nil {
-		return fmt.Errorf("marshal mpu index: %w", err)
-	}
-	return writeDurableAtomic(path, b)
-}
-
 // writeMpUploadMeta persists the upload's object metadata as a plain JSON file,
 // durably (so a crash at Create does not silently lose the upload metadata).
 func writeMpUploadMeta(path string, m metaProperties) error {
@@ -270,8 +309,10 @@ func readMpUploadMeta(path string) (metaProperties, error) {
 	return m, nil
 }
 
-// find returns the recorded part with the given number and its slice index, or
-// (nil, -1) if absent.
+// --- index helpers --------------------------------------------------------
+
+// find returns the recorded (placed) part with the given number and its slice
+// index, or (nil, -1) if absent.
 func (idx *otterMpuIndex) find(n int) (*otterMpuPart, int) {
 	for i := range idx.Parts {
 		if idx.Parts[i].PartNumber == n {
@@ -281,7 +322,7 @@ func (idx *otterMpuIndex) find(n int) (*otterMpuPart, int) {
 	return nil, -1
 }
 
-// put inserts or replaces a part record.
+// put inserts or replaces a placed part record.
 func (idx *otterMpuIndex) put(part otterMpuPart) {
 	if _, i := idx.find(part.PartNumber); i >= 0 {
 		idx.Parts[i] = part
@@ -290,90 +331,80 @@ func (idx *otterMpuIndex) put(part otterMpuPart) {
 	idx.Parts = append(idx.Parts, part)
 }
 
+// lenOf returns the true length of a part number whether it is placed or still
+// pending, or 0 if unknown.
+func (idx *otterMpuIndex) lenOf(n int) int64 {
+	if rec, _ := idx.find(n); rec != nil {
+		return rec.Len
+	}
+	if pp, ok := idx.pending[n]; ok {
+		return pp.length
+	}
+	return 0
+}
+
 // --- placement ------------------------------------------------------------
 
 // mpDisposition is what UploadPart should do with an incoming part.
 type mpDisposition int
 
 const (
-	dispPlace mpDisposition = iota // write at the returned final offset (no-copy fast path)
-	dispStash                      // append to the .stash file (caller assigns StashOffset)
+	dispPlace  mpDisposition = iota // write at the returned final offset (no-copy fast path)
+	dispBuffer                      // hold in the pre-stride buffer (RAM or spill)
 )
 
-// classify decides ONLY what UploadPart can safely decide with no global view of
-// the upload. It does NOT mutate the index and it does NOT reject anything:
-// final size/uniformity rejection is deferred to Complete, where the
-// authoritative ordered part list is known.
+// classify decides where an incoming (partNum n, length L) goes, purely from the
+// current index. It NEVER mutates and NEVER rejects — final size/uniformity
+// rejection is deferred to Complete. It returns the final data-file offset (when
+// placeable), the disposition, and the stride value confirmed BY this part
+// (newStride == 0 means the stride is still unresolved).
 //
-//   - If the stride is confirmed and the part equals it, it is a full part:
-//     write it once at its final offset (the no-copy fast path).
-//   - If this is part #1, it is authoritative for S (and is the whole object for
-//     a single-part upload), so write it at offset 0; the caller sets idx.Stride
-//     after a successful write.
-//   - Else if at least one OTHER distinct part is already recorded, the stride is
-//     resolvable as max(this part, the others): at most one part (the last) may
-//     be short, so the larger of any two parts is the full stride S. A part whose
-//     length is the max is a full part — place it at (n-1)*S; a shorter part is
-//     the tail — stash it. The caller persists idx.Stride after the write.
-//   - Otherwise (stride unknown, only this part seen, not #1) stash it; the
-//     stride is not yet resolvable. Final classification happens at Complete.
+//   - Once the stride is known, EVERY part is placed directly at (n-1)*S — full
+//     or short. A short tail's offset is deterministic; if it turns out not to be
+//     the tail, Complete's uniformity check rejects the whole upload.
+//   - Part #1 is authoritative for S (place@0).
+//   - Otherwise the stride resolves the moment a SECOND distinct part number is
+//     seen, as max(this length, the other parts' max) — so this part can be
+//     placed and the caller then drains the one buffered part.
+//   - Only when no other distinct part has been seen (and this is not #1) can the
+//     stride not be resolved: buffer this part.
 //
-// A re-upload of an already-recorded part number is NOT counted as a second
-// distinct sample (it would let a retried short tail masquerade as the stride).
-func (idx *otterMpuIndex) classify(n int, L int64) (offset int64, disp mpDisposition) {
+// The distinct-part scan unions Parts (placed) AND pending, because a pre-stride
+// part lives in pending, not Parts.
+func (idx *otterMpuIndex) classify(n int, L int64) (offset int64, disp mpDisposition, newStride int64) {
 	if idx.Stride != 0 {
-		if L == idx.Stride {
-			return int64(n-1) * idx.Stride, dispPlace
-		}
-		return 0, dispStash
+		return int64(n-1) * idx.Stride, dispPlace, idx.Stride
 	}
 	if n == 1 {
-		return 0, dispPlace
+		return 0, dispPlace, L
 	}
-	// Stride not yet confirmed: resolve it from the max across >=2 distinct parts.
 	otherMax, others := int64(0), 0
-	for i := range idx.Parts {
-		if idx.Parts[i].PartNumber == n {
-			continue // a re-upload of this same part is not a second distinct sample
+	consider := func(pn int, l int64) {
+		if pn == n {
+			return // a re-upload of this same part is not a second distinct sample
 		}
 		others++
-		if idx.Parts[i].Len > otherMax {
-			otherMax = idx.Parts[i].Len
+		if l > otherMax {
+			otherMax = l
 		}
+	}
+	for i := range idx.Parts {
+		consider(idx.Parts[i].PartNumber, idx.Parts[i].Len)
+	}
+	for pn, pp := range idx.pending {
+		consider(pn, pp.length)
 	}
 	if others >= 1 {
-		if L >= otherMax {
-			return int64(n-1) * L, dispPlace // this part is the (tied) largest => full part, S==L
+		S := L
+		if otherMax > S {
+			S = otherMax
 		}
-		return 0, dispStash // shorter than a seen full part => the tail
+		return int64(n-1) * S, dispPlace, S
 	}
-	return 0, dispStash // only this part seen and it isn't #1: cannot resolve S yet
+	return 0, dispBuffer, 0
 }
 
-// --- recompute (Complete) -------------------------------------------------
-
-// recomputePartMD5 returns the quoted hex MD5 ETag of the data file range
-// [offset, offset+length), matching backend.GenerateEtag.
-func recomputePartMD5(f *os.File, offset, length int64) (string, error) {
-	h := md5.New()
-	if _, err := io.Copy(h, io.NewSectionReader(f, offset, length)); err != nil {
-		return "", err
-	}
-	return backend.GenerateEtag(h), nil
-}
-
-// recomputePartCRC64NVME returns the part's internal CRC64NVME checksum over the
-// data file range, matching what UploadPart records today.
-func recomputePartCRC64NVME(f *os.File, offset, length int64) (string, error) {
-	hr, err := utils.NewHashReader(io.NewSectionReader(f, offset, length), "", utils.HashTypeCRC64NVME)
-	if err != nil {
-		return "", err
-	}
-	if _, err := io.Copy(io.Discard, hr); err != nil {
-		return "", err
-	}
-	return hr.Sum(), nil
-}
+// --- byte I/O helpers -----------------------------------------------------
 
 // offsetWriter streams io.Copy output into a file at a fixed starting offset via
 // WriteAt, so a part can be written at its computed position in the data file.
@@ -414,13 +445,25 @@ func userPartChecksum(input *s3.UploadPartInput) (utils.HashType, string) {
 	return "", ""
 }
 
-// uploadPartAtOffset implements UploadPart for the sameDirTmp (Otter) path. The
-// whole read-modify-write runs under the per-uploadID lock. A part whose final
-// offset is known (confirmed stride match, or part #1) is written once at that
-// offset in the data file (no-copy fast path); any other part is appended to the
-// upload's single .stash file and folded at Complete. The data write precedes the
-// index commit and Complete re-validates every part's MD5, so a crash can only
-// cost a retry, never a silently corrupt object (no fsync needed; see writeAtomic).
+// mpuWriteErr maps a data-write error to the right S3 error.
+func mpuWriteErr(err error) error {
+	if errors.Is(err, syscall.ENOSPC) {
+		return s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+	}
+	if _, ok := err.(s3err.S3Error); ok {
+		return err
+	}
+	return fmt.Errorf("write part data: %w", err)
+}
+
+// --- UploadPart -----------------------------------------------------------
+
+// uploadPartAtOffset implements UploadPart for the Af2 write-at-offset path under
+// the complete-only-fsync model. A part whose final offset is known (stride
+// confirmed, or part #1) is written once at that offset in the data file (page
+// cache, NO fsync); any other part is buffered in RAM (or spilled to disk if it
+// exceeds the cap) and flushed the instant the stride resolves. The whole
+// read-modify-write runs under the per-uploadID lock.
 func (p *Posix) uploadPartAtOffset(bucket, object, uploadID string, partNum int, length int64, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
 	if length <= 0 {
 		// A reliable offset needs a known, positive part length; reject rather
@@ -432,53 +475,24 @@ func (p *Posix) uploadPartAtOffset(bucket, object, uploadID string, partNum int,
 	mu.Lock()
 	defer mu.Unlock()
 
-	idxPath := mpIndexPath(bucket, object, uploadID)
-	idx, err := readMpIndex(idxPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("read mpu index: %w", err)
-		}
-		idx = &otterMpuIndex{}
+	idx, loaded := p.getMpuIndex(bucket, object, uploadID)
+	if !loaded {
+		// Fresh in-memory index: drop any scratch a prior attempt left on disk
+		// under this uploadID (e.g. across a gateway restart) so stale bytes
+		// cannot survive into this attempt.
+		_ = os.Remove(mpDataFilePath(bucket, object, uploadID))
+		_ = os.Remove(mpStashFilePath(bucket, object, uploadID))
 	}
 
-	offset, disp := idx.classify(partNum, length)
+	offset, disp, newStride := idx.classify(partNum, length)
 
-	var targetPath string
-	var writeOff int64
-	switch disp {
-	case dispPlace:
-		targetPath = mpDataFilePath(bucket, object, uploadID)
-		writeOff = offset
-	default: // dispStash
-		targetPath = mpStashFilePath(bucket, object, uploadID)
-		writeOff = idx.StashNext
-	}
-
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-		return nil, fmt.Errorf("create object dir: %w", err)
-	}
-	tf, err := os.OpenFile(targetPath, os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		if errors.Is(err, syscall.ENOSPC) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
-		}
-		return nil, fmt.Errorf("open mpu part file: %w", err)
-	}
-	defer tf.Close()
-
+	// Stream the body once: md5 (ETag) + CRC32C (+ optional user checksum).
 	hash := md5.New()
 	tr := io.TeeReader(input.Body, hash)
 
-	// Compute the part's CRC64NVME as it streams, so CompleteMultipartUpload can
-	// accumulate the full-object checksum from the index with no data re-read.
-	crcRdr, err := utils.NewHashReader(tr, "", utils.HashTypeCRC64NVME)
-	if err != nil {
-		return nil, fmt.Errorf("init part crc reader: %w", err)
-	}
-	tr = crcRdr
-
 	chAlgo, chVal := userPartChecksum(input)
 	var hashRdr *utils.HashReader
+	var err error
 	if chAlgo != "" {
 		hashRdr, err = utils.NewHashReader(tr, chVal, chAlgo)
 		if err != nil {
@@ -486,62 +500,101 @@ func (p *Posix) uploadPartAtOffset(bucket, object, uploadID string, partNum int,
 		}
 		tr = hashRdr
 	}
-
-	written, err := io.Copy(&offsetWriter{f: tf, off: writeOff}, tr)
+	// Internal full-object checksum: CRC32C (hardware-accelerated via SSE4.2, and
+	// the algorithm the aws CLI sends by default) — replaces the table-based
+	// CRC64NVME. crc32Combine supports it, so the O(1) Complete accumulation is
+	// unchanged.
+	crcRdr, err := utils.NewHashReader(tr, "", utils.HashTypeCRC32C)
 	if err != nil {
-		if errors.Is(err, syscall.ENOSPC) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
-		}
-		if _, ok := err.(s3err.S3Error); ok {
-			return nil, err
-		}
-		return nil, fmt.Errorf("write part data: %w", err)
+		return nil, fmt.Errorf("init part crc reader: %w", err)
 	}
+	tr = crcRdr
 
-	// Crash-safety invariant: the part bytes are durable before its index record names them.
-	if err := tf.Sync(); err != nil {
-		return nil, fmt.Errorf("fsync mpu part file: %w", err)
+	var written int64
+	switch disp {
+	case dispPlace:
+		dataPath := mpDataFilePath(bucket, object, uploadID)
+		if err := os.MkdirAll(filepath.Dir(dataPath), p.newDirPerm); err != nil {
+			return nil, fmt.Errorf("create object dir: %w", err)
+		}
+		df, err := os.OpenFile(dataPath, os.O_RDWR|os.O_CREATE, 0600)
+		if err != nil {
+			if errors.Is(err, syscall.ENOSPC) {
+				return nil, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+			}
+			return nil, fmt.Errorf("open mpu data file: %w", err)
+		}
+		written, err = io.Copy(&offsetWriter{f: df, off: offset}, tr)
+		if err != nil {
+			df.Close()
+			return nil, mpuWriteErr(err)
+		}
+		df.Close() // NO fsync
+
+	default: // dispBuffer
+		// Evict-before-insert: a re-upload of an already-pending part must
+		// reconcile the RAM counter and rewind the spill cursor so the spill file
+		// is rewritten in place (never grown across retries).
+		if old, ok := idx.pending[partNum]; ok {
+			if old.data != nil {
+				idx.pendingRAM -= old.length
+			}
+			if old.spilled {
+				idx.spillNext = old.spillOff
+			}
+			delete(idx.pending, partNum)
+		}
+
+		if idx.pendingRAM+length <= p.mpuMemBufferMax {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, mpuWriteErr(err)
+			}
+			written = int64(len(data))
+			idx.pending[partNum] = &pendingPart{data: data, length: written}
+			idx.pendingRAM += written
+		} else {
+			spillPath := mpStashFilePath(bucket, object, uploadID)
+			if err := os.MkdirAll(filepath.Dir(spillPath), p.newDirPerm); err != nil {
+				return nil, fmt.Errorf("create object dir: %w", err)
+			}
+			sf, err := os.OpenFile(spillPath, os.O_RDWR|os.O_CREATE, 0600)
+			if err != nil {
+				if errors.Is(err, syscall.ENOSPC) {
+					return nil, s3err.GetAPIError(s3err.ErrNoSpaceLeftOnDevice)
+				}
+				return nil, fmt.Errorf("open mpu spill file: %w", err)
+			}
+			spillOff := idx.spillNext
+			written, err = io.Copy(&offsetWriter{f: sf, off: spillOff}, tr)
+			if err != nil {
+				sf.Close()
+				return nil, mpuWriteErr(err)
+			}
+			sf.Close() // NO fsync
+			idx.pending[partNum] = &pendingPart{spilled: true, spillOff: spillOff, length: written}
+			idx.spillNext = spillOff + written
+		}
 	}
 
 	etag := backend.GenerateEtag(hash)
 	partCRC := crcRdr.Sum()
 
-	rec := otterMpuPart{PartNumber: partNum, Len: written, ETag: etag, CRC: partCRC}
-	switch disp {
-	case dispPlace:
-		rec.Offset = offset
-	default: // dispStash
-		rec.Stashed = true
-		rec.StashOffset = writeOff
-		idx.StashNext += written
+	if disp == dispPlace {
+		idx.put(otterMpuPart{PartNumber: partNum, Offset: offset, Len: written, ETag: etag, CRC: partCRC})
+	} else {
+		pp := idx.pending[partNum]
+		pp.length = written
+		pp.etag = etag
+		pp.crc = partCRC
 	}
 
-	// Resolve/confirm the stride S so later parts take the no-copy fast path.
-	// Part #1 is authoritative; otherwise S becomes resolvable the moment a second
-	// distinct part number is seen, as the max of the distinct parts' true lengths
-	// (current part included) — at most one part may be short, so that max is S.
-	if idx.Stride == 0 {
-		if partNum == 1 {
-			idx.Stride = written
-		} else {
-			maxLen, distinct := written, 1
-			for i := range idx.Parts {
-				if idx.Parts[i].PartNumber == partNum {
-					continue // not a second distinct sample
-				}
-				distinct++
-				if idx.Parts[i].Len > maxLen {
-					maxLen = idx.Parts[i].Len
-				}
-			}
-			if distinct >= 2 {
-				idx.Stride = maxLen
-			}
+	// Stride just resolved: persist it and drain the (at most one) buffered part.
+	if newStride != 0 && idx.Stride == 0 {
+		idx.Stride = newStride
+		if err := p.flushPending(bucket, object, uploadID, idx); err != nil {
+			return nil, err
 		}
-	}
-	idx.put(rec)
-	if err := writeMpIndexAtomic(idxPath, idx); err != nil {
-		return nil, fmt.Errorf("write mpu index: %w", err)
 	}
 
 	res := &s3.UploadPartOutput{ETag: &etag}
@@ -552,19 +605,89 @@ func (p *Posix) uploadPartAtOffset(bucket, object, uploadID string, partNum int,
 	return res, nil
 }
 
-// completeMultipartAtOffset implements CompleteMultipartUpload for the sameDirTmp
-// (Otter) path. The whole validate → fold → claim → reveal sequence runs under
-// the per-uploadID lock. Stride S and the true last part N are resolved from the
-// authoritative ordered client part list; stashed parts are folded into the data
-// file before validation, so the validation loop then sees every part at its
-// final offset and the uniform-except-shorter-last upload lands on the no-copy
-// reveal branch.
-func (p *Posix) completeMultipartAtOffset(input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
+// flushPending writes every buffered part into the data file at its final offset
+// (n-1)*Stride (page cache, NO fsync), converting each into a placed record.
+// Requires idx.Stride > 0. It subtracts from pendingRAM only for RAM-held parts
+// (spilled parts never counted), and removes the spill file once drained.
+func (p *Posix) flushPending(bucket, object, uploadID string, idx *otterMpuIndex) error {
+	if len(idx.pending) == 0 {
+		return nil
+	}
+	dataPath := mpDataFilePath(bucket, object, uploadID)
+	if err := os.MkdirAll(filepath.Dir(dataPath), p.newDirPerm); err != nil {
+		return fmt.Errorf("create object dir: %w", err)
+	}
+	df, err := os.OpenFile(dataPath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return fmt.Errorf("open mpu data file: %w", err)
+	}
+	defer df.Close()
+
+	var sf *os.File
+	defer func() {
+		if sf != nil {
+			sf.Close()
+		}
+	}()
+
+	usedSpill := false
+	for pn, pp := range idx.pending {
+		off := int64(pn-1) * idx.Stride
+		if pp.spilled {
+			if sf == nil {
+				sf, err = os.Open(mpStashFilePath(bucket, object, uploadID))
+				if err != nil {
+					return fmt.Errorf("open mpu spill file: %w", err)
+				}
+			}
+			if _, err := io.Copy(&offsetWriter{f: df, off: off}, io.NewSectionReader(sf, pp.spillOff, pp.length)); err != nil {
+				return fmt.Errorf("flush spilled part: %w", err)
+			}
+			usedSpill = true
+		} else {
+			if _, err := df.WriteAt(pp.data, off); err != nil {
+				return fmt.Errorf("flush buffered part: %w", err)
+			}
+			idx.pendingRAM -= pp.length
+		}
+		idx.put(otterMpuPart{PartNumber: pn, Offset: off, Len: pp.length, ETag: pp.etag, CRC: pp.crc})
+		delete(idx.pending, pn)
+	}
+
+	if usedSpill {
+		if sf != nil {
+			sf.Close()
+			sf = nil
+		}
+		_ = os.Remove(mpStashFilePath(bucket, object, uploadID))
+		idx.spillNext = 0
+	}
+	return nil
+}
+
+// --- CompleteMultipartUpload ----------------------------------------------
+
+// completeMultipartAtOffset implements CompleteMultipartUpload for the
+// Af2 write-at-offset path under the complete-only-fsync model. It validates the
+// client part list, resolves the stride, drains any residual buffered part,
+// validates uniformity/ETags against the in-memory index (no data re-read), then
+// reveals the object with a single data fsync + durable rename. The whole
+// sequence runs under the per-uploadID lock.
+func (p *Posix) completeMultipartAtOffset(acct auth.Account, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
 	res := s3response.CompleteMultipartUploadResult{}
 	bucket := *input.Bucket
 	object := *input.Key
 	uploadID := *input.UploadId
 	parts := input.MultipartUpload.Parts
+
+	// The Af2 write-at-offset path does not create object versions (it reveals a
+	// single current object by rename). Versioning is disabled in the Otter
+	// deployment by design — point-in-time is CDM's SLA-driven recovery points,
+	// not S3 versioning. Fail loud rather than silently returning an empty
+	// versionID if versioning is ever enabled on this backend.
+	if p.versioningEnabled() {
+		return res, "", s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
 
 	s3MD5, err := backend.GetMultipartMD5(parts)
 	if err != nil {
@@ -576,70 +699,84 @@ func (p *Posix) completeMultipartAtOffset(input *s3.CompleteMultipartUploadInput
 	defer mu.Unlock()
 
 	dataPath := mpDataFilePath(bucket, object, uploadID)
-	stashPath := mpStashFilePath(bucket, object, uploadID)
-	completingPath := mpCompletingPath(bucket, object, uploadID)
 	finalPath := filepath.Join(bucket, object)
 
+	// Idempotency: the on-disk upload state is gone. If the final object exists,
+	// a prior Complete already succeeded — return success; else it never existed.
 	if _, err := p.checkUploadIDExists(bucket, object, uploadID); err != nil {
-		// Idempotency: a retry after a successful completion finds the upload
-		// state already removed; if the final object exists, treat as success.
 		if _, statErr := os.Stat(finalPath); statErr == nil {
+			p.delMpuIndex(bucket, object, uploadID)
 			p.mpuUnlockDelete(bucket, object, uploadID)
 			return s3response.CompleteMultipartUploadResult{Bucket: &bucket, ETag: &s3MD5, Key: &object}, "", nil
 		}
 		return res, "", err
 	}
 
-	// Resume path: a crash between the claim-rename and the final reveal leaves
-	// the (already-folded) data under completingPath with no dataPath. Re-run
-	// validation + reveal from completingPath.
-	if _, statErr := os.Stat(dataPath); os.IsNotExist(statErr) {
-		if _, cstatErr := os.Stat(completingPath); cstatErr == nil {
-			return p.validateRevealMpu(input, completingPath, finalPath, s3MD5, true)
+	idx, ok := p.peekMpuIndex(bucket, object, uploadID)
+	if !ok {
+		// In-memory state lost (e.g. gateway restart). If the object somehow
+		// already exists treat as success; otherwise the client must re-upload
+		// the whole object.
+		if _, statErr := os.Stat(finalPath); statErr == nil {
+			p.mpuUnlockDelete(bucket, object, uploadID)
+			return s3response.CompleteMultipartUploadResult{Bucket: &bucket, ETag: &s3MD5, Key: &object}, "", nil
 		}
+		return res, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 	}
 
-	idx, err := readMpIndex(mpIndexPath(bucket, object, uploadID))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return res, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+	// (1) Validate the client part-list SHAPE + ORDER first. On the Otter path
+	// this is the ONLY guard against an out-of-order Complete list (nothing
+	// upstream enforces it), and CRC accumulation + range assembly below iterate
+	// in listed order — so a mis-ordered list would otherwise assemble a corrupt
+	// object and return 200.
+	var prevPN int32
+	for _, part := range parts {
+		if part.PartNumber == nil || part.ETag == nil {
+			return res, "", s3err.GetAPIError(s3err.ErrMalformedXML)
 		}
-		return res, "", fmt.Errorf("read mpu index: %w", err)
+		if *part.PartNumber < 1 {
+			return res, "", s3err.GetInvalidArgumentErr(s3err.InvalidArgCompleteMpPartNumber, fmt.Sprint(*part.PartNumber))
+		}
+		if *part.PartNumber <= prevPN {
+			return res, "", s3err.GetAPIError(s3err.ErrInvalidPartOrder)
+		}
+		prevPN = *part.PartNumber
 	}
 
-	// --- pre-validate & resolve stride from the authoritative ordered list ----
-	//
-	// N is the TRUE last part (max listed PartNumber); S is the stride, taken
-	// from part #1 if known, else from the lowest-numbered listed part's record.
+	// (2) Resolve N (true last part) and S (stride). S is the confirmed stride if
+	// known, else the lowest-numbered listed part's length (part #1 never arrived).
 	var N int
 	for _, part := range parts {
-		if part.PartNumber != nil && int(*part.PartNumber) > N {
+		if int(*part.PartNumber) > N {
 			N = int(*part.PartNumber)
 		}
 	}
 	S := idx.Stride
 	if S == 0 {
-		// Part #1 never arrived: resolve S from the lowest-numbered listed part.
 		lowest := -1
 		for _, part := range parts {
-			if part.PartNumber == nil {
-				continue
-			}
 			if lowest < 0 || int(*part.PartNumber) < lowest {
 				lowest = int(*part.PartNumber)
 			}
 		}
 		if lowest >= 0 {
-			if rec, _ := idx.find(lowest); rec != nil {
-				S = rec.Len
-			}
+			S = idx.lenOf(lowest)
+		}
+	}
+	// Drain any residual buffered part only when the stride is resolvable; if S
+	// is still 0 (e.g. the lowest listed part was never uploaded) skip the flush
+	// and let validation below reject the missing part.
+	if idx.Stride == 0 && S > 0 {
+		idx.Stride = S
+	}
+	if idx.Stride > 0 {
+		if err := p.flushPending(bucket, object, uploadID, idx); err != nil {
+			return res, "", fmt.Errorf("flush pending parts: %w", err)
 		}
 	}
 
+	// (3) Validate every listed part against the (now fully placed) index.
 	for _, part := range parts {
-		if part.PartNumber == nil || part.ETag == nil {
-			return res, "", s3err.GetAPIError(s3err.ErrMalformedXML)
-		}
 		pn := int(*part.PartNumber)
 		rec, _ := idx.find(pn)
 		if rec == nil {
@@ -647,79 +784,22 @@ func (p *Posix) completeMultipartAtOffset(input *s3.CompleteMultipartUploadInput
 		}
 		isLast := pn == N
 		if !isLast && rec.Len != S {
-			// Genuine non-uniform interior part (or a 2nd short part).
 			return res, "", s3err.GetInvalidPartErr(uploadID, *part.PartNumber, *part.ETag)
 		}
 		if isLast && rec.Len > S {
-			// The tail cannot exceed the stride.
 			return res, "", s3err.GetInvalidPartErr(uploadID, *part.PartNumber, *part.ETag)
 		}
 		if !isLast && rec.Len < backend.MinPartSize {
 			return res, "", s3err.GetEntityTooSmallErr(rec.Len, backend.MinPartSize)
 		}
+		if !backend.AreEtagsSame(rec.ETag, *part.ETag) {
+			return res, "", s3err.GetInvalidPartErr(uploadID, *part.PartNumber, *part.ETag)
+		}
 	}
 
-	// --- write-ahead fold of stashed parts into the data file -----------------
-	//
-	// For each listed part whose bytes still live in the stash file, copy them to
-	// their final offset (partNum-1)*S in the data file, flip the record, and
-	// persist the index. The stash is NOT dropped here — it stays until the
-	// post-reveal cleanup — so a crash mid-fold either re-folds from the still-
-	// present stash, or (if an index flip persisted ahead of its data) is caught
-	// by the per-part MD5 check at Complete as InvalidPart → client retry. Never a
-	// corrupt object, so no fsync is needed.
-	idxPath := mpIndexPath(bucket, object, uploadID)
-	needFold := false
-	for _, part := range parts {
-		if rec, _ := idx.find(int(*part.PartNumber)); rec != nil && rec.Stashed {
-			needFold = true
-			break
-		}
-	}
-	if needFold {
-		sf, err := os.Open(stashPath)
-		if err != nil {
-			return res, "", fmt.Errorf("open mpu stash file: %w", err)
-		}
-		df, err := os.OpenFile(dataPath, os.O_RDWR|os.O_CREATE, 0600)
-		if err != nil {
-			sf.Close()
-			return res, "", fmt.Errorf("open mpu data file: %w", err)
-		}
-		for _, part := range parts {
-			pn := int(*part.PartNumber)
-			rec, ri := idx.find(pn)
-			if rec == nil || !rec.Stashed {
-				continue
-			}
-			finalOff := int64(pn-1) * S
-			if _, err := io.Copy(&offsetWriter{f: df, off: finalOff},
-				io.NewSectionReader(sf, rec.StashOffset, rec.Len)); err != nil {
-				df.Close()
-				sf.Close()
-				return res, "", fmt.Errorf("fold stashed part: %w", err)
-			}
-			if err := df.Sync(); err != nil {
-				df.Close()
-				sf.Close()
-				return res, "", fmt.Errorf("fsync folded data file: %w", err)
-			}
-			idx.Parts[ri].Stashed = false
-			idx.Parts[ri].Offset = finalOff
-			idx.Parts[ri].StashOffset = 0
-			if err := writeMpIndexAtomic(idxPath, idx); err != nil {
-				df.Close()
-				sf.Close()
-				return res, "", fmt.Errorf("write mpu index after fold: %w", err)
-			}
-		}
-		df.Close()
-		sf.Close()
-	}
-
-	// All folds durable: drop stray bytes beyond the parts' extent and remove the
-	// stash. dataSize is the parts' max committed extent, NOT the raw file size,
-	// so leftover stash/scratch bytes can never neuter the crash guard.
+	// (4) Truncate the data file to the listed parts' extent (drop stray/spill
+	// bytes so leftover scratch can never neuter the crash guard), and remove the
+	// spill file if it still exists.
 	var dataSize int64
 	for _, part := range parts {
 		if rec, _ := idx.find(int(*part.PartNumber)); rec != nil {
@@ -731,25 +811,14 @@ func (p *Posix) completeMultipartAtOffset(input *s3.CompleteMultipartUploadInput
 	if err := os.Truncate(dataPath, dataSize); err != nil {
 		return res, "", fmt.Errorf("truncate mpu data file: %w", err)
 	}
-	os.Remove(stashPath)
+	_ = os.Remove(mpStashFilePath(bucket, object, uploadID))
 
-	if err := os.MkdirAll(filepath.Dir(finalPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(finalPath), p.newDirPerm); err != nil {
 		return res, "", fmt.Errorf("create object dir: %w", err)
 	}
 
-	// Claim the upload by renaming the data file; ENOENT => another caller won.
-	if err := os.Rename(dataPath, completingPath); err != nil {
-		if os.IsNotExist(err) {
-			if _, statErr := os.Stat(finalPath); statErr == nil {
-				p.mpuUnlockDelete(bucket, object, uploadID)
-				return s3response.CompleteMultipartUploadResult{Bucket: &bucket, ETag: &s3MD5, Key: &object}, "", nil
-			}
-			return res, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
-		}
-		return res, "", fmt.Errorf("claim mpu data file: %w", err)
-	}
-
-	return p.validateRevealMpu(input, completingPath, finalPath, s3MD5, false)
+	// (5) Accumulate the full-object CRC in listed order + reveal.
+	return p.revealMpu(acct, input, idx, dataPath, finalPath, s3MD5)
 }
 
 // revealKind records which Complete reveal branch was taken, for tests that must
@@ -761,25 +830,20 @@ const (
 	revealCompact                   // non-contiguous layout compacted into a temp
 )
 
-// validateRevealMpu runs the post-fold validation loop against srcPath (the
-// claimed completingPath, where every listed part now lives at its final
-// offset), recomputes per-part MD5/CRC, and reveals the object — by rename when
-// the layout is contiguous (no-copy), else by compacting the listed ranges. It
-// is also the resume entry point (resume==true) when a crash left only
-// completingPath. On success it cleans up state and drops the lock entry.
-func (p *Posix) validateRevealMpu(input *s3.CompleteMultipartUploadInput, srcPath, finalPath, s3MD5 string, resume bool) (s3response.CompleteMultipartUploadResult, string, error) {
+// revealMpu accumulates the full-object CRC32C from the per-part records (no
+// data re-read), then reveals the object: by rename when the recorded layout is
+// already contiguous [0,total) (no-copy), else by compacting the listed ranges
+// into a same-dir temp. The single data fsync (and the parent-dir fsync after
+// the rename) are the durability point. On success it cleans up all state.
+// Callers must have validated the part list and placed every listed part.
+func (p *Posix) revealMpu(acct auth.Account, input *s3.CompleteMultipartUploadInput, idx *otterMpuIndex, dataPath, finalPath, s3MD5 string) (s3response.CompleteMultipartUploadResult, string, error) {
 	res := s3response.CompleteMultipartUploadResult{}
 	bucket := *input.Bucket
 	object := *input.Key
 	uploadID := *input.UploadId
 	parts := input.MultipartUpload.Parts
 
-	idx, err := readMpIndex(mpIndexPath(bucket, object, uploadID))
-	if err != nil {
-		return res, "", fmt.Errorf("read mpu index: %w", err)
-	}
-
-	df, err := os.OpenFile(srcPath, os.O_RDWR, 0600)
+	df, err := os.OpenFile(dataPath, os.O_RDWR, 0600)
 	if err != nil {
 		return res, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 	}
@@ -788,77 +852,26 @@ func (p *Posix) validateRevealMpu(input *s3.CompleteMultipartUploadInput, srcPat
 		df.Close()
 		return res, "", fmt.Errorf("stat mpu data file: %w", err)
 	}
-	fileSize := dfi.Size()
-
-	// dataSize is the parts' max committed extent (the crash guard reference),
-	// never the raw file size.
-	var dataSize int64
-	for _, part := range parts {
-		if part.PartNumber == nil {
-			continue
-		}
-		if rec, _ := idx.find(int(*part.PartNumber)); rec != nil {
-			if end := rec.Offset + rec.Len; end > dataSize {
-				dataSize = end
-			}
-		}
-	}
+	fileSize := dfi.Size() // after the caller's truncate-to-extent
 
 	type rng struct{ off, length int64 }
 	ranges := make([]rng, 0, len(parts))
-	last := len(parts) - 1
 	var totalsize, cumulative int64
-	var prevPartNum int32
 	contiguous := true
 	crc := ""
 
 	for i, part := range parts {
-		if part.PartNumber == nil || part.ETag == nil {
-			df.Close()
-			return res, "", s3err.GetAPIError(s3err.ErrMalformedXML)
-		}
-		if *part.PartNumber < 1 {
-			df.Close()
-			return res, "", s3err.GetInvalidArgumentErr(s3err.InvalidArgCompleteMpPartNumber, fmt.Sprint(*part.PartNumber))
-		}
-		if *part.PartNumber <= prevPartNum {
-			df.Close()
-			return res, "", s3err.GetAPIError(s3err.ErrInvalidPartOrder)
-		}
-		prevPartNum = *part.PartNumber
-
 		rec, _ := idx.find(int(*part.PartNumber))
-		// Hard error (not a silent skip) if the index has no entry or the data
-		// write did not fully land — covers a crash between data write and index
-		// update. dataSize is the parts' extent, so stray bytes can't mask it.
-		if rec == nil || rec.Offset+rec.Len > dataSize {
+		if rec == nil { // guarded by the caller; defensive
 			df.Close()
 			return res, "", s3err.GetInvalidPartErr(uploadID, *part.PartNumber, *part.ETag)
 		}
-		if i < last && rec.Len < backend.MinPartSize {
-			df.Close()
-			return res, "", s3err.GetEntityTooSmallErr(rec.Len, backend.MinPartSize)
-		}
-
-		// Verify the client's claimed ETag against the ETag recorded at UploadPart.
-		// No data re-read: the part's bytes were MD5'd when written (rec.ETag), and
-		// their durability is the storage layer's job (fsync at UploadPart). This
-		// replaces the former per-part re-hash of the whole object, which dominated
-		// Complete latency (a full second pass over the data).
-		if !backend.AreEtagsSame(rec.ETag, *part.ETag) {
-			df.Close()
-			return res, "", s3err.GetInvalidPartErr(uploadID, *part.PartNumber, *part.ETag)
-		}
-
-		// Accumulate the full-object CRC64NVME from the per-part CRCs recorded at
-		// UploadPart (rec.CRC) — again with no data read.
 		if i == 0 {
 			crc = rec.CRC
-		} else if crc, err = utils.AddCRCChecksum(types.ChecksumAlgorithmCrc64nvme, crc, rec.CRC, rec.Len); err != nil {
+		} else if crc, err = utils.AddCRCChecksum(types.ChecksumAlgorithmCrc32c, crc, rec.CRC, rec.Len); err != nil {
 			df.Close()
 			return res, "", fmt.Errorf("accumulate crc: %w", err)
 		}
-
 		if rec.Offset != cumulative {
 			contiguous = false
 		}
@@ -866,75 +879,90 @@ func (p *Posix) validateRevealMpu(input *s3.CompleteMultipartUploadInput, srcPat
 		totalsize += rec.Len
 		ranges = append(ranges, rng{rec.Offset, rec.Len})
 	}
-	df.Close()
 
 	// content-type / user metadata captured at Create live in the upload-meta
 	// plain file (not a DESC attr, since the state dir is a directory).
 	mprops, err := readMpUploadMeta(mpUploadMetaPath(bucket, object, uploadID))
 	if err != nil {
-		// Best-effort: proceed without object metadata if unreadable.
-		mprops = metaProperties{}
+		mprops = metaProperties{} // best-effort
 	}
 
 	if contiguous && cumulative == fileSize {
-		// Data already laid out [0,total); reveal it with no copy.
-		p.lastRevealKind = revealNoCopy
-		cf, err := os.OpenFile(srcPath, os.O_RDWR, 0600)
-		if err != nil {
-			return res, "", fmt.Errorf("open completing file: %w", err)
-		}
-		if err := cf.Truncate(totalsize); err != nil {
-			cf.Close()
+		// Data already laid out [0,total): reveal with no copy.
+		p.lastRevealKind.Store(int32(revealNoCopy))
+		if err := df.Truncate(totalsize); err != nil {
+			df.Close()
 			return res, "", fmt.Errorf("truncate completing file: %w", err)
 		}
-		if err := p.writeFinalMpuMeta(cf, bucket, object, s3MD5, mprops); err != nil {
-			cf.Close()
+		if err := p.writeFinalMpuMeta(df, bucket, object, s3MD5, mprops); err != nil {
+			df.Close()
 			return res, "", err
 		}
-		cf.Close()
-		if err := os.Rename(srcPath, finalPath); err != nil {
+		if err := p.applyFinalObjectPerms(df, acct); err != nil {
+			df.Close()
+			return res, "", err
+		}
+		if err := df.Sync(); err != nil { // single data-durability point
+			df.Close()
+			return res, "", fmt.Errorf("fsync mpu data file: %w", err)
+		}
+		df.Close()
+		if err := os.Rename(dataPath, finalPath); err != nil {
 			return res, "", fmt.Errorf("reveal object: %w", err)
 		}
-	} else {
-		// Non-contiguous completion (gaps/reordered/re-pinned-stride): compact the
-		// listed parts in order into a same-dir temp, then reveal.
-		p.lastRevealKind = revealCompact
-		srcf, err := os.Open(srcPath)
-		if err != nil {
-			return res, "", fmt.Errorf("open completing file: %w", err)
+		if err := fsyncParentDir(finalPath); err != nil {
+			return res, "", fmt.Errorf("fsync parent dir: %w", err)
 		}
-		asmPath := srcPath + ".asm"
+	} else {
+		// Non-contiguous completion (gaps / reordered / re-pinned stride): compact
+		// the listed ranges in order into a same-dir temp, then reveal.
+		p.lastRevealKind.Store(int32(revealCompact))
+		asmPath := dataPath + ".asm"
 		af, err := os.OpenFile(asmPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 		if err != nil {
-			srcf.Close()
+			df.Close()
 			return res, "", fmt.Errorf("open assemble file: %w", err)
 		}
 		for _, rg := range ranges {
-			if _, err := io.Copy(af, io.NewSectionReader(srcf, rg.off, rg.length)); err != nil {
+			if _, err := io.Copy(af, io.NewSectionReader(df, rg.off, rg.length)); err != nil {
 				af.Close()
-				srcf.Close()
+				df.Close()
 				os.Remove(asmPath)
 				return res, "", fmt.Errorf("assemble object: %w", err)
 			}
 		}
-		srcf.Close()
+		df.Close()
 		if err := p.writeFinalMpuMeta(af, bucket, object, s3MD5, mprops); err != nil {
 			af.Close()
 			os.Remove(asmPath)
 			return res, "", err
+		}
+		if err := p.applyFinalObjectPerms(af, acct); err != nil {
+			af.Close()
+			os.Remove(asmPath)
+			return res, "", err
+		}
+		if err := af.Sync(); err != nil { // single data-durability point
+			af.Close()
+			os.Remove(asmPath)
+			return res, "", fmt.Errorf("fsync assemble file: %w", err)
 		}
 		af.Close()
 		if err := os.Rename(asmPath, finalPath); err != nil {
 			os.Remove(asmPath)
 			return res, "", fmt.Errorf("reveal object: %w", err)
 		}
-		os.Remove(srcPath)
+		if err := fsyncParentDir(finalPath); err != nil {
+			return res, "", fmt.Errorf("fsync parent dir: %w", err)
+		}
+		os.Remove(dataPath)
 	}
 
-	// Best-effort cleanup of the upload's state dir, stash, and hash dir.
-	os.Remove(mpStashFilePath(bucket, object, uploadID))
+	// Cleanup: state dir, spill, hash dir, in-memory index, lock entry.
+	_ = os.Remove(mpStashFilePath(bucket, object, uploadID))
 	os.RemoveAll(mpStateDir(bucket, object, uploadID))
 	cleanupMpHashDir(mpHashDir(bucket, object))
+	p.delMpuIndex(bucket, object, uploadID)
 	p.mpuUnlockDelete(bucket, object, uploadID)
 
 	fullObject := types.ChecksumTypeFullObject
@@ -942,8 +970,8 @@ func (p *Posix) validateRevealMpu(input *s3.CompleteMultipartUploadInput, srcPat
 		Bucket:            &bucket,
 		ETag:              &s3MD5,
 		Key:               &object,
-		ChecksumCRC64NVME: &crc,
-		ChecksumType:      &fullObject,
+		ChecksumCRC32C: &crc,
+		ChecksumType:   &fullObject,
 	}, "", nil
 }
 
@@ -960,21 +988,17 @@ func (p *Posix) writeFinalMpuMeta(f *os.File, bucket, object, etag string, mprop
 	return nil
 }
 
-// listPartsFromIndex builds ListParts results from the per-upload index (full
-// fidelity: correct sizes and ETags), honoring part-number-marker / max-parts.
+// --- ListParts ------------------------------------------------------------
+
+// listPartsFromIndex builds ListParts results from the in-memory index (placed
+// parts + any pending part, both carrying the true PartNumber/Len/ETag),
+// honoring part-number-marker / max-parts. Offsets are never emitted.
 func (p *Posix) listPartsFromIndex(bucket, object, uploadID string, marker, maxParts int) (s3response.ListPartsResult, error) {
-	// Take the per-uploadID lock for a consistent snapshot of the index against
-	// concurrent UploadPart/Complete. Stashed parts are normal records carrying
-	// the true PartNumber/Len/ETag, so they surface with the right size/ETag; we
-	// never emit Offset/StashOffset (only PartNumber/Size/ETag go to the client).
 	mu := p.mpuLock(bucket, object, uploadID)
 	mu.Lock()
 	defer mu.Unlock()
 
-	idx, err := readMpIndex(mpIndexPath(bucket, object, uploadID))
-	if err != nil && !os.IsNotExist(err) {
-		return s3response.ListPartsResult{}, fmt.Errorf("read mpu index: %w", err)
-	}
+	idx, _ := p.peekMpuIndex(bucket, object, uploadID)
 
 	var modTime time.Time
 	if fi, statErr := os.Stat(mpDataFilePath(bucket, object, uploadID)); statErr == nil {
@@ -984,6 +1008,9 @@ func (p *Posix) listPartsFromIndex(bucket, object, uploadID string, marker, maxP
 	var recs []otterMpuPart
 	if idx != nil {
 		recs = append(recs, idx.Parts...)
+		for pn, pp := range idx.pending {
+			recs = append(recs, otterMpuPart{PartNumber: pn, Len: pp.length, ETag: pp.etag})
+		}
 	}
 	sort.Slice(recs, func(i, j int) bool { return recs[i].PartNumber < recs[j].PartNumber })
 
@@ -1025,7 +1052,7 @@ func (p *Posix) listPartsFromIndex(bucket, object, uploadID string, marker, maxP
 }
 
 // readMpObjName returns the S3 key for a multipart hash dir, reading the plain
-// objname file first (written under sameDirTmp so it survives the DESC storer
+// objname file first (written by the Af2 path so it survives the DESC storer
 // dropping the onameAttr attribute) and falling back to the metadata storer.
 func (p *Posix) readMpObjName(bucket, hashName string) (string, error) {
 	b, err := os.ReadFile(filepath.Join(bucket, MetaTmpMultipartDir, hashName, onameAttr))
@@ -1060,8 +1087,15 @@ func cleanupMpHashDir(hashDir string) {
 // Af2MPUHandler is an MPUHandler for Rubrik CDM SDFS AF2 channels. It writes
 // every part directly at its final byte offset in a single data file and
 // reveals the completed object with a same-directory rename — one write per
-// byte, no staging copy. The stash-the-tail mechanism handles parts that
-// arrive before the stride is resolvable or that are shorter than the stride.
+// byte, no staging copy. Under the complete-only-fsync model the per-upload
+// index is in-memory; nothing is fsync'd until Complete.
+//
+// Scope (v1): Otter serves Postgres base backup and WAL archival — first-party,
+// CDM-orchestrated clients in a single trust domain. Object-lock
+// (retention/legal-hold), tagging, versioning, and a retrievable checksum
+// attribute are intentionally not supported on this path (retention/immutability
+// and point-in-time are CDM SLA-driven, not S3-level; write-time integrity is
+// still enforced via the stored ETag + per-part CRC32C validated at Complete).
 type Af2MPUHandler struct{}
 
 func (Af2MPUHandler) CreateMultipartUpload(_ context.Context, p *Posix, mpu s3response.CreateMultipartUploadInput, bucket, object, uploadID string) (s3response.InitiateMultipartUploadResult, error) {
@@ -1087,8 +1121,9 @@ func (Af2MPUHandler) UploadPart(_ context.Context, p *Posix, input *s3.UploadPar
 	return p.uploadPartAtOffset(*input.Bucket, *input.Key, *input.UploadId, int(aws.ToInt32(input.PartNumber)), length, input)
 }
 
-func (Af2MPUHandler) CompleteMultipartUpload(_ context.Context, p *Posix, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
-	return p.completeMultipartAtOffset(input)
+func (Af2MPUHandler) CompleteMultipartUpload(ctx context.Context, p *Posix, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
+	acct, _ := ctx.Value("account").(auth.Account)
+	return p.completeMultipartAtOffset(acct, input)
 }
 
 func (Af2MPUHandler) AbortMultipartUpload(_ context.Context, p *Posix, input *s3.AbortMultipartUploadInput) error {
@@ -1104,6 +1139,7 @@ func (Af2MPUHandler) AbortMultipartUpload(_ context.Context, p *Posix, input *s3
 	os.Remove(mpStashFilePath(bucket, object, uploadID))
 	os.RemoveAll(mpStateDir(bucket, object, uploadID))
 	cleanupMpHashDir(mpHashDir(bucket, object))
+	p.delMpuIndex(bucket, object, uploadID)
 	p.mpuUnlockDelete(bucket, object, uploadID)
 	return nil
 }
