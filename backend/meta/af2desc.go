@@ -45,10 +45,12 @@ import (
 //     read-back is the C++/Thrift af2GetPartitionMetadata path, out of scope
 //     for the gateway.
 //
-// Deliberately unsupported in v1 (see droppedKeys). Otter v1 is a single-tenant
-// WAL data path, not a general S3 service, so object-lock (retention/legal-hold),
-// object tagging, the retrievable checksum attribute, and version-id are accepted
-// and dropped rather than persisted. Rationale: retention/immutability are
+// Deliberately unsupported in v1 (see droppedKeys). Otter v1 serves Postgres
+// base backup and WAL archival — first-party, CDM-orchestrated clients in a
+// single trust domain, not a general S3 service — so object-lock
+// (retention/legal-hold), object tagging, the retrievable checksum attribute,
+// and version-id are accepted and dropped rather than persisted. Rationale:
+// retention/immutability are
 // enforced by CDM's SLA-driven recovery-point lifecycle (not S3 object-lock);
 // write-time integrity still holds (the ETag/MD5 is stored and every MPU part's
 // checksum is validated at Complete — only the retrievable stored-checksum
@@ -137,8 +139,9 @@ var descKeys = map[string]bool{
 // (accepted and dropped, not an oversight). These correspond to the backend's
 // key constants for object-lock, object tagging, the retrievable checksum
 // attribute, and version-id. See the Af2Desc type doc for the full rationale;
-// the short version: Otter v1 is a single-tenant WAL data path where
-// retention/immutability come from CDM's SLA lifecycle (not S3 object-lock),
+// the short version: Otter v1 serves base backup + WAL for first-party clients
+// in a single trust domain, where retention/immutability come from CDM's SLA
+// lifecycle (not S3 object-lock),
 // write-time integrity is preserved via the stored ETag + per-part checksum
 // validation, no tag-policy consumers exist, and versioning is disabled.
 //
