@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -96,11 +97,28 @@ type Posix struct {
 
 	// mpuLocks holds one *sync.Mutex per in-flight Af2MPUHandler uploadID.
 	// Only populated when mpuHandler is Af2MPUHandler.
+	//
+	// NOTE (leak, v1): mpuLocks and mpuIndexes entries are removed only on
+	// Complete/Abort. An upload that receives parts but is never finalized leaks
+	// its entry for the process lifetime. Bounded reclamation (TTL/janitor) is a
+	// follow-up; v1 WAL is single-PUT and base backup completes its uploads, so
+	// the practical footprint is small.
 	mpuLocks sync.Map
 
+	// mpuIndexes holds the in-memory per-upload write-at-offset index for the
+	// Af2MPUHandler (complete-only-fsync model), keyed by (bucket,object,uploadID).
+	// It is not durable; a gateway restart drops it and the client retries.
+	mpuIndexes sync.Map
+
+	// mpuMemBufferMax caps the bytes an Af2MPUHandler multipart upload may hold in
+	// memory for a pre-stride part before spilling it to a page-cache-only disk
+	// file. Zero uses defaultMpuMemBufferMax.
+	mpuMemBufferMax int64
+
 	// lastRevealKind records which CompleteMultipartUpload reveal branch the
-	// Af2MPUHandler last took. Test-only observability field.
-	lastRevealKind revealKind
+	// Af2MPUHandler last took (as an int32 revealKind). Test-only observability;
+	// atomic so concurrent completes of different uploads don't race on it.
+	lastRevealKind atomic.Int32
 
 	// sameDirTmp creates the temp file used for atomic object writes in
 	// the SAME directory as the final object (instead of a per-bucket
@@ -216,6 +234,15 @@ type PosixOpts struct {
 	// directory so the commit rename is same-directory. Required for
 	// filesystems that reject cross-directory rename (e.g. SDFS).
 	SameDirTmp bool
+	// Af2MPU selects the AF2 write-at-offset multipart strategy (Af2MPUHandler)
+	// instead of the default staging-and-concat. Independent of SameDirTmp so
+	// that enabling same-dir-tmp purely for the cross-dir-rename fix does not
+	// also change multipart semantics. The otter subcommand sets both.
+	Af2MPU bool
+	// MpuMemBufferMax caps the bytes an Af2MPUHandler multipart upload may buffer
+	// in memory for a pre-stride part before spilling to disk. Zero uses the
+	// default.
+	MpuMemBufferMax int64
 }
 
 func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, error) {
@@ -275,7 +302,8 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		bucketlinks:          opts.BucketLinks,
 		versioningDir:        versioningdirAbs,
 		newDirPerm:           opts.NewDirPerm,
-		mpuHandler:           chooseMPUHandler(opts.SameDirTmp),
+		mpuHandler:           chooseMPUHandler(opts.Af2MPU),
+		mpuMemBufferMax:      mpuBufferMaxOrDefault(opts.MpuMemBufferMax),
 		forceNoTmpFile:       opts.ForceNoTmpFile,
 		forceNoCopyFileRange: opts.ForceNoCopyFileRange,
 		sameDirTmp:           opts.SameDirTmp,
@@ -283,6 +311,18 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		actionLimiter:        semaphore.NewWeighted(int64(concurrencyOrDefault(opts.Concurrency))),
 		copyObjectThreshold:  opts.CopyObjectThreshold,
 	}, nil
+}
+
+// defaultMpuMemBufferMax caps in-memory buffering of a pre-stride Af2MPUHandler
+// multipart part before spilling to a page-cache-only disk file (64 MiB).
+const defaultMpuMemBufferMax int64 = 64 << 20
+
+// mpuBufferMaxOrDefault returns n if positive, otherwise defaultMpuMemBufferMax.
+func mpuBufferMaxOrDefault(n int64) int64 {
+	if n > 0 {
+		return n
+	}
+	return defaultMpuMemBufferMax
 }
 
 // concurrencyOrDefault returns n if it is positive, otherwise defaultConcurrency.

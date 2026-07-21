@@ -22,9 +22,12 @@ import (
 	"github.com/versity/versitygw/s3response"
 )
 
-// chooseMPUHandler returns the right MPUHandler for the given configuration.
-func chooseMPUHandler(sameDirTmp bool) MPUHandler {
-	if sameDirTmp {
+// chooseMPUHandler returns the multipart write strategy: the AF2 write-at-offset
+// handler when af2MPU is set (the otter/AF2 deployment), otherwise the default
+// staging-and-concat handler. Keyed on its own flag, independent of same-dir-tmp,
+// so enabling the cross-dir-rename fix does not change multipart semantics.
+func chooseMPUHandler(af2MPU bool) MPUHandler {
+	if af2MPU {
 		return Af2MPUHandler{}
 	}
 	return StandardMPUHandler{}
