@@ -44,6 +44,36 @@ import (
 //     ErrNoSuchKey, which callers already treat as "empty"; restore-time
 //     read-back is the C++/Thrift af2GetPartitionMetadata path, out of scope
 //     for the gateway.
+//
+// Deliberately unsupported in v1 (see droppedKeys). Otter v1 is a single-tenant
+// WAL data path, not a general S3 service, so object-lock (retention/legal-hold),
+// object tagging, the retrievable checksum attribute, and version-id are accepted
+// and dropped rather than persisted. Rationale: retention/immutability are
+// enforced by CDM's SLA-driven recovery-point lifecycle (not S3 object-lock);
+// write-time integrity still holds (the ETag/MD5 is stored and every MPU part's
+// checksum is validated at Complete — only the retrievable stored-checksum
+// surface is dropped); no S3 lifecycle/tag-policy consumers exist; and versioning
+// is disabled in this deployment. StoreAttribute cannot error on these keys — the
+// normal object-write path stores them in sequence, so erroring would fail every
+// qualifying PUT; if these features ever enter scope, reject at the operation
+// layer (PutObjectRetention/PutObjectLegalHold/PutObjectTagging) instead.
+//
+// Known operational limits (v1):
+//   - Unbounded cache. One entry per (bucket,object) ever touched is retained;
+//     nothing evicts. Eviction is intentionally deferred: on SDFS the cache IS
+//     the read path (no getxattr), so evicting an entry would make a later GET
+//     return empty metadata. Bounding the cache (LRU/janitor) is safe only once
+//     the getxattr / WarmCache read-back path lands; until then plan for a
+//     footprint of roughly one small entry per live object.
+//   - Binary user-metadata. Values are packed via json.Marshal, which replaces
+//     invalid UTF-8 with U+FFFD, so arbitrary binary metadata values do not
+//     round-trip byte-exactly. S3 user metadata is spec'd as printable ASCII, so
+//     this only affects out-of-spec binary values.
+//   - Restart read-back gap. The cache is process-local and not persisted; after
+//     a gateway restart it is cold and read-back of pre-restart objects returns
+//     ErrNoSuchKey (etag/content-type appear empty) until WarmCache (or a
+//     getxattr read path) repopulates it. Object data + DESC stay durable in the
+//     snapshot; only live re-serving is affected.
 type Af2Desc struct {
 	// mu guards the structure of the cache map (entry insert/lookup/move).
 	mu    sync.RWMutex
@@ -101,6 +131,30 @@ var descKeys = map[string]bool{
 	"acl":       true,
 	"ownership": true,
 	"tagging":   true,
+}
+
+// droppedKeys are object attributes that Otter v1 deliberately does NOT persist
+// (accepted and dropped, not an oversight). These correspond to the backend's
+// key constants for object-lock, object tagging, the retrievable checksum
+// attribute, and version-id. See the Af2Desc type doc for the full rationale;
+// the short version: Otter v1 is a single-tenant WAL data path where
+// retention/immutability come from CDM's SLA lifecycle (not S3 object-lock),
+// write-time integrity is preserved via the stored ETag + per-part checksum
+// validation, no tag-policy consumers exist, and versioning is disabled.
+//
+// This set is documentation/intent only — the accept-and-drop is enforced by the
+// descKeys allowlist miss in StoreAttribute. It is listed explicitly so the drop
+// is a reviewable decision, and so a future reader can see exactly what is not
+// persisted. It must NOT be turned into a store-time error: the normal
+// object-write path calls StoreAttribute for these keys in sequence, so erroring
+// would fail every qualifying PUT. If these features enter scope, reject at the
+// operation layer instead.
+var droppedKeys = map[string]bool{
+	"X-Amz-Tagging":     true, // object tagging (tagHdr)
+	"object-retention":  true, // WORM retention (objectRetentionKey)
+	"object-legal-hold": true, // WORM legal hold (objectLegalHoldKey)
+	"checksums":         true, // retrievable stored checksum (checksumsKey)
+	"version-id":        true, // versioning disabled in this deployment (versionIdKey)
 }
 
 var _ MetadataStorer = (*Af2Desc)(nil)
@@ -274,6 +328,15 @@ func (a *Af2Desc) RetrieveAttribute(f *os.File, bucket, object, attribute string
 	if len(e.m) == 0 {
 		if m, err := readBlob(f, path); err == nil {
 			e.m = m
+			// Record the inode alongside the cold-filled map. Without this the
+			// entry's ino stays 0, and the next fd-based StoreAttribute would see
+			// ino(0) != the real inode, wrongly conclude the object was replaced,
+			// and wipe this freshly-read metadata.
+			if f != nil {
+				if ino, ok := inoOf(f); ok {
+					e.ino = ino
+				}
+			}
 			if v, ok := m[attribute]; ok {
 				return []byte(v), nil
 			}
@@ -290,6 +353,7 @@ func (a *Af2Desc) DeleteAttribute(bucket, object, attribute string) error {
 	defer sh.Unlock()
 
 	e := a.entry(path)
+	prev, had := e.m[attribute]
 	delete(e.m, attribute)
 
 	var err error
@@ -302,10 +366,15 @@ func (a *Af2Desc) DeleteAttribute(bucket, object, attribute string) error {
 			err = xattr.Set(path, descXattrName, blob)
 		}
 	}
+	// ENOATTR/ENOTSUP => nothing was (or could be) persisted; the cache deletion
+	// stands and we report success. On any real error, revert the cache so it
+	// stays consistent with disk (reads are cache-authoritative), matching
+	// StoreAttribute's revert-on-failure behavior.
 	if errors.Is(err, xattr.ENOATTR) || errors.Is(err, syscall.ENOTSUP) {
 		return nil
 	}
 	if err != nil {
+		a.revert(e, attribute, prev, had)
 		return mapXattrErr(err)
 	}
 	return nil

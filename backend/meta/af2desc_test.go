@@ -171,6 +171,30 @@ func TestAf2DescDropNonAllowlisted(t *testing.T) {
 	}
 }
 
+// TestAf2DescDroppedKeys verifies the deliberately-unsupported v1 keys
+// (object-lock, tagging, checksums, version-id) are accepted-and-dropped:
+// StoreAttribute succeeds (must NOT error — the object-write path stores these
+// in sequence), the value is not retrievable, and nothing is written to disk.
+func TestAf2DescDroppedKeys(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "o")
+	f := mustCreate(t, p)
+	s := NewAf2Desc(0)
+
+	for key := range droppedKeys {
+		if err := s.StoreAttribute(f, dir, "o", key, []byte("x")); err != nil {
+			t.Fatalf("store dropped key %q should no-op, got: %v", key, err)
+		}
+		if _, err := retr(t, s, dir, "o", key); !errors.Is(err, ErrNoSuchKey) {
+			t.Fatalf("dropped key %q retrieve err=%v (want ErrNoSuchKey)", key, err)
+		}
+	}
+	// Only dropped keys were stored, so no DESC blob should exist on disk.
+	if _, err := xattr.Get(p, descXattrName); err == nil {
+		t.Fatalf("DESC xattr exists but only dropped keys were stored")
+	}
+}
+
 // TestAf2DescOverCap: a write that would exceed maxLen is rejected and prior
 // state is preserved.
 func TestAf2DescOverCap(t *testing.T) {
