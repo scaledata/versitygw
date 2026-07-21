@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"io/fs"
 	"path"
-	"slices"
 	"strings"
 	"syscall"
 
@@ -173,8 +172,15 @@ func WalkVersions(ctx context.Context, fileSystem fs.FS, prefix, delimiter, keyM
 		if path == "." {
 			return nil
 		}
-		if slices.Contains(skipdirs, d.Name()) {
-			return fs.SkipDir
+		if isSkipped(d.Name(), skipdirs) {
+			// For the reserved staging directory, skip its whole subtree.
+			// For a hidden temp FILE, skip only that entry — returning
+			// fs.SkipDir on a non-directory would skip the rest of the
+			// containing directory and drop real objects that sort after it.
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 
 		if !pastMarker {
@@ -549,7 +555,24 @@ func checkAndMaybeAddCommonPrefix(objectName string, walkstate *walkState,
 }
 
 func shouldSkip(name string, walkstate *walkState) bool {
-	return slices.Contains(walkstate.skipdirs, name)
+	return isSkipped(name, walkstate.skipdirs)
+}
+
+// isSkipped reports whether a directory-entry name is reserved and must be
+// hidden from listings. An entry is skipped when its name exactly matches a
+// reserved name in skipdirs (e.g. the ".sgwtmp" staging directory) OR begins
+// with that name plus a "." separator (e.g. the same-dir-tmp temp/data files
+// ".sgwtmp.<hash>.<rand>", which live beside real objects). The prefix form is
+// required because --same-dir-tmp writes hidden scratch as siblings of real
+// objects rather than inside the reserved directory; an exact match alone would
+// leak those scratch files into listings as phantom objects.
+func isSkipped(name string, skipdirs []string) bool {
+	for _, s := range skipdirs {
+		if name == s || strings.HasPrefix(name, s+".") {
+			return true
+		}
+	}
+	return false
 }
 
 func addContentEntry(objectName string, dirEntry fs.DirEntry, walkstate *walkState) bool {

@@ -644,18 +644,36 @@ func (p *Posix) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, a
 	return nil
 }
 
+// isReservedEntry reports whether a bucket-directory entry is internal gateway
+// scratch that must not count as bucket contents: the ".sgwtmp" staging
+// directory, or a same-dir-tmp temp/data file ".sgwtmp.<hash>.<...>" that
+// --same-dir-tmp writes beside real objects (top-level keys stage in the bucket
+// root). This mirrors backend.isSkipped so emptiness and listings agree on what
+// is internal.
+func isReservedEntry(name string) bool {
+	return name == MetaTmpDir || strings.HasPrefix(name, MetaTmpDir+".")
+}
+
+// hasUserEntries reports whether ents contains any entry that is not internal
+// gateway scratch (see isReservedEntry). Any number of reserved entries may be
+// present without making the bucket non-empty.
+func hasUserEntries(ents []os.DirEntry) bool {
+	for _, e := range ents {
+		if !isReservedEntry(e.Name()) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Posix) isBucketEmpty(bucket string) error {
 	if p.versioningEnabled() {
 		ents, err := os.ReadDir(filepath.Join(p.versioningDir, bucket))
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("readdir bucket: %w", err)
 		}
-		if err == nil {
-			if len(ents) == 1 && ents[0].Name() != MetaTmpDir {
-				return s3err.GetBucketErr(s3err.ErrVersionedBucketNotEmpty, bucket)
-			} else if len(ents) > 1 {
-				return s3err.GetBucketErr(s3err.ErrVersionedBucketNotEmpty, bucket)
-			}
+		if err == nil && hasUserEntries(ents) {
+			return s3err.GetBucketErr(s3err.ErrVersionedBucketNotEmpty, bucket)
 		}
 	}
 
@@ -666,9 +684,7 @@ func (p *Posix) isBucketEmpty(bucket string) error {
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
-	if len(ents) == 1 && ents[0].Name() != MetaTmpDir {
-		return s3err.GetBucketErr(s3err.ErrBucketNotEmpty, bucket)
-	} else if len(ents) > 1 {
+	if hasUserEntries(ents) {
 		return s3err.GetBucketErr(s3err.ErrBucketNotEmpty, bucket)
 	}
 

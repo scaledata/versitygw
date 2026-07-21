@@ -107,7 +107,9 @@ func (tmp *tmpfile) link() error {
 	backoffMs := initialBackoffMs
 	for {
 		err = backend.MoveFile(tempname, objPath, defaultFilePerm)
-		if !errors.Is(err, syscall.ENOENT) {
+		// errors.Is(ENOENT) covers Linux (incl. the EXDEV-fallback %w chain);
+		// os.IsNotExist also covers Windows, whose not-exist error is not ENOENT.
+		if !errors.Is(err, syscall.ENOENT) && !os.IsNotExist(err) {
 			break
 		}
 		// The parent directory may have been concurrently removed; backoff and retry.

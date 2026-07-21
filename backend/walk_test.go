@@ -1497,3 +1497,61 @@ func comparePrefixesUnordered(got []types.CommonPrefix, want []string) bool {
 	}
 	return true
 }
+
+// TestWalkSkipsSameDirTmp verifies that --same-dir-tmp scratch files, which live
+// beside real objects as ".sgwtmp.<hash>.<rand>" siblings, are excluded from
+// object listings — not just the reserved ".sgwtmp" directory. Before the
+// prefix-aware skip, the exact-match skip rule leaked these as phantom objects.
+func TestWalkSkipsSameDirTmp(t *testing.T) {
+	fsys := fstest.MapFS{
+		"realfile":                  {},
+		".sgwtmp.abc123.tmp456":     {}, // top-level temp (bucket-root sibling)
+		"dir/realfile2":             {},
+		"dir/.sgwtmp.def789.tmp012": {}, // nested temp
+		".sgwtmp/multipart/x/y":     {}, // reserved staging subtree
+	}
+
+	res, err := backend.Walk(context.Background(), fsys, "", "", "", 1000,
+		getObjSkipDirs, []string{".sgwtmp"})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+
+	expected := backend.WalkResults{
+		Objects: []s3response.Object{
+			{Key: backend.GetPtrFromString("dir/realfile2")},
+			{Key: backend.GetPtrFromString("realfile")},
+		},
+	}
+	compareResults("skip same-dir-tmp", res, expected, t)
+}
+
+// TestWalkVersionsSkipsSameDirTmp verifies the WalkVersions path excludes
+// same-dir-tmp scratch too. The temp entries are named to sort BEFORE their real
+// siblings ("." < "r"), which would expose a regression if a matched FILE
+// returned fs.SkipDir (that skips the rest of the parent directory, dropping the
+// real objects that follow) instead of skipping only that entry.
+func TestWalkVersionsSkipsSameDirTmp(t *testing.T) {
+	fsys := fstest.MapFS{
+		".sgwtmp.zzz.tmp":      {}, // root temp, sorts before "rootfile"
+		"rootfile":             {},
+		"dir/.sgwtmp.aaa.tmp":  {}, // nested temp, sorts before "dir/realfile"
+		"dir/realfile":         {},
+		".sgwtmp/multipart/x":  {}, // reserved staging subtree
+	}
+
+	expected := backend.WalkVersioningResults{
+		ObjectVersions: []s3response.ObjectVersion{
+			{Key: backend.GetPtrFromString("dir/")},
+			{Key: backend.GetPtrFromString("dir/realfile")},
+			{Key: backend.GetPtrFromString("rootfile")},
+		},
+	}
+
+	res, err := backend.WalkVersions(context.Background(), fsys, "", "", "", "", 1000,
+		getVersionsTestFunc, []string{".sgwtmp"})
+	if err != nil {
+		t.Fatalf("walk versions: %v", err)
+	}
+	compareVersionResultsOrdered("skip same-dir-tmp versions", res, expected, t)
+}
