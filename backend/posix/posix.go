@@ -88,8 +88,9 @@ type Posix struct {
 	forceNoCopyFileRange bool
 
 	// mpuHandler is the pluggable multipart upload write strategy.
-	// Defaults to StandardMPUHandler (staging-and-concat). Set to
-	// Af2MPUHandler when sameDirTmp is true to get write-at-offset semantics.
+	// Defaults to StandardMPUHandler (staging-and-concat). An alternative
+	// implementation can be supplied at construction to change the multipart
+	// write path without touching the S3 verb handlers.
 	mpuHandler MPUHandler
 
 	// sameDirTmp creates the temp file used for atomic object writes in
