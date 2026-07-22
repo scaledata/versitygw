@@ -2,6 +2,12 @@ module github.com/versity/versitygw
 
 go 1.25.0
 
+// Require a patched Go toolchain: go1.26.0–1.26.3 stdlib carries GO-2026-5038
+// (CVE-2026-42504, HIGH — quadratic complexity in mime.WordDecoder.DecodeHeader),
+// plus GO-2026-5037 (crypto/x509) and GO-2026-5039 (net/textproto). All fixed in
+// 1.26.4. Builds must use >= 1.26.4; keeps the go language level at 1.25.0.
+toolchain go1.26.4
+
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.22.0
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.0
