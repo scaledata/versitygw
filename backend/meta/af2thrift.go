@@ -455,6 +455,9 @@ func parseStringMap(r *rbuf) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if count < 0 || count > 1024 {
+		return nil, fmt.Errorf("parseStringMap: invalid count %d", count)
+	}
 	m := make(map[string]string, count)
 	for i := 0; i < int(count); i++ {
 		k, err := r.str()
