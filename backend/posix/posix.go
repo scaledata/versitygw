@@ -647,44 +647,85 @@ func (p *Posix) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, a
 // isReservedEntry reports whether a bucket-directory entry is internal gateway
 // scratch that must not count as bucket contents: the ".sgwtmp" staging
 // directory, or a same-dir-tmp temp/data file ".sgwtmp.<hash>.<...>" that
-// --same-dir-tmp writes beside real objects (top-level keys stage in the bucket
-// root). This mirrors backend.isSkipped so emptiness and listings agree on what
-// is internal.
+// --same-dir-tmp writes beside real objects. For a nested key the scratch lands
+// in the key's own parent directory, not the bucket root, so this predicate is
+// applied at every level of the tree (see bucketDirHasContent). This mirrors
+// backend.isSkipped so emptiness and listings agree on what is internal.
 func isReservedEntry(name string) bool {
 	return name == MetaTmpDir || strings.HasPrefix(name, MetaTmpDir+".")
 }
 
-// hasUserEntries reports whether ents contains any entry that is not internal
-// gateway scratch (see isReservedEntry). Any number of reserved entries may be
-// present without making the bucket non-empty.
-func hasUserEntries(ents []os.DirEntry) bool {
+// bucketDirHasContent reports whether the directory tree rooted at
+// filepath.Join(root, rel) holds any user-visible object, ignoring reserved
+// gateway scratch (see isReservedEntry). A non-reserved regular file is always
+// an object. A subdirectory counts only if it is itself a directory object (an
+// empty directory carrying a stored etag, matching FileToObj's rule) or
+// recursively contains one; otherwise it is just a key prefix and is walked
+// through. This is what lets an orphaned same-dir-tmp scratch file left in an
+// otherwise-empty nested prefix — e.g. "a/b/.sgwtmp.<hash>.<rand>" from a PUT
+// to "a/b/obj" that crashed before the commit rename — not block DeleteBucket,
+// while a real empty directory-object marker still does. The walk returns as
+// soon as the first real object is found, so a non-empty bucket bails without
+// scanning the whole tree; only a genuinely-empty bucket pays the full descent.
+func (p *Posix) bucketDirHasContent(root, rel string) (bool, error) {
+	ents, err := os.ReadDir(filepath.Join(root, rel))
+	if err != nil {
+		// A subdirectory that vanished mid-scan (raced with a concurrent
+		// delete) simply holds nothing; only a missing root is meaningful,
+		// and that is surfaced so the caller can report "no such bucket".
+		if errors.Is(err, fs.ErrNotExist) && rel != "" {
+			return false, nil
+		}
+		return false, err
+	}
+
 	for _, e := range ents {
-		if !isReservedEntry(e.Name()) {
-			return true
+		if isReservedEntry(e.Name()) {
+			continue
+		}
+		child := filepath.Join(rel, e.Name())
+		if !e.IsDir() {
+			// A non-reserved regular file is a real object (any size).
+			return true, nil
+		}
+		// A directory carrying an etag is an explicitly-created directory
+		// object (real content); one without is only a key prefix — recurse.
+		if _, err := p.meta.RetrieveAttribute(nil, root, child, etagkey); err == nil {
+			return true, nil
+		} else if !errors.Is(err, meta.ErrNoSuchKey) && !errors.Is(err, fs.ErrNotExist) {
+			return false, fmt.Errorf("get etag %q: %w", child, err)
+		}
+		has, err := p.bucketDirHasContent(root, child)
+		if err != nil {
+			return false, err
+		}
+		if has {
+			return true, nil
 		}
 	}
-	return false
+
+	return false, nil
 }
 
 func (p *Posix) isBucketEmpty(bucket string) error {
 	if p.versioningEnabled() {
-		ents, err := os.ReadDir(filepath.Join(p.versioningDir, bucket))
+		has, err := p.bucketDirHasContent(filepath.Join(p.versioningDir, bucket), "")
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("readdir bucket: %w", err)
+			return fmt.Errorf("scan versioned bucket: %w", err)
 		}
-		if err == nil && hasUserEntries(ents) {
+		if has {
 			return s3err.GetBucketErr(s3err.ErrVersionedBucketNotEmpty, bucket)
 		}
 	}
 
-	ents, err := os.ReadDir(bucket)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("readdir bucket: %w", err)
-	}
+	has, err := p.bucketDirHasContent(bucket, "")
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
-	if hasUserEntries(ents) {
+	if err != nil {
+		return fmt.Errorf("scan bucket: %w", err)
+	}
+	if has {
 		return s3err.GetBucketErr(s3err.ErrBucketNotEmpty, bucket)
 	}
 
