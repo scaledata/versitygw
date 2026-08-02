@@ -372,3 +372,71 @@ func TestAf2DescConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestAf2DescRenameObjectRace exercises RenameObject concurrently with
+// StoreAttribute/RetrieveAttribute on the same old/new paths. It verifies the
+// shard-lock ordering added to RenameObject is deadlock-free and race-clean
+// (run with -race); the test completing at all is the deadlock assertion.
+func TestAf2DescRenameObjectRace(t *testing.T) {
+	dir := t.TempDir()
+	s := NewAf2Desc(0)
+
+	// Pre-create both targets so the path-based xattr ops succeed.
+	oldName, newName := "staging-old", "staging-new"
+	mustCreate(t, filepath.Join(dir, oldName))
+	mustCreate(t, filepath.Join(dir, newName))
+
+	const iters = 200
+	var wg sync.WaitGroup
+
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			_ = s.StoreAttribute(nil, dir, oldName, "etag", []byte("E"))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if err := s.RenameObject(dir, oldName, newName); err != nil {
+				t.Errorf("RenameObject: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			_, _ = s.RetrieveAttribute(nil, dir, newName, "etag")
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestAf2DescBucketTaggingDropped verifies tagging is accepted-and-dropped, not
+// cache-preserved. The real callers (CreateBucket/PutBucketTagging/
+// PutObjectTagging) store under backend/posix's tagHdr = "X-Amz-Tagging", which
+// is not in the descKeys allowlist, so it must round-trip as ErrNoSuchKey.
+// acl/ownership, stored in the same CreateBucket sequence, stay cache-preserved.
+func TestAf2DescBucketTaggingDropped(t *testing.T) {
+	dir := t.TempDir()
+	s := NewAf2Desc(0)
+
+	const tagHdr = "X-Amz-Tagging" // backend/posix tagHdr constant
+
+	if err := s.StoreAttribute(nil, dir, "", tagHdr, []byte("k=v")); err != nil {
+		t.Fatalf("store tagging: %v", err)
+	}
+	if _, err := s.RetrieveAttribute(nil, dir, "", tagHdr); !errors.Is(err, ErrNoSuchKey) {
+		t.Fatalf("bucket tagging err = %v; want dropped (ErrNoSuchKey)", err)
+	}
+
+	if err := s.StoreAttribute(nil, dir, "", "acl", []byte("ACL")); err != nil {
+		t.Fatalf("store acl: %v", err)
+	}
+	if got, err := retr(t, s, dir, "", "acl"); err != nil || got != "ACL" {
+		t.Fatalf("bucket acl = %q, %v; want preserved", got, err)
+	}
+}

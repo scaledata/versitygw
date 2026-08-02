@@ -17,6 +17,7 @@ package main
 import (
 	"fmt"
 	"io/fs"
+	"log"
 	"math"
 
 	"github.com/urfave/cli/v2"
@@ -182,6 +183,14 @@ func runPosix(ctx *cli.Context) error {
 	switch {
 	case af2Desc:
 		ms = meta.NewAf2Desc(af2DescMaxBytes)
+		// Surface the af2-desc metadata limitations at startup rather than
+		// leaving them silent: bucket-level ACL/ownership is held in the
+		// write-through cache only (SDFS getxattr is unimplemented), so it does
+		// not survive a gateway restart until repopulated out-of-band; and
+		// tagging, object-lock, and retrievable checksums are not persisted at
+		// all (accepted and dropped) in this deployment scope.
+		log.Printf("af2-desc: bucket ACL/ownership metadata is cache-only and does not survive a restart")
+		log.Printf("af2-desc: object/bucket tagging, object-lock, and stored checksums are not persisted (dropped)")
 	case sidecar != "":
 		sc, err := meta.NewSideCar(sidecar)
 		if err != nil {

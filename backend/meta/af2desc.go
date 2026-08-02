@@ -130,9 +130,14 @@ var descKeys = map[string]bool{
 	// Bucket-level metadata — stored in-cache only (SDFS getxattr is
 	// unimplemented, but the write-through cache keeps them alive for
 	// the process lifetime, which is enough for bucket ACL/ownership).
+	//
+	// Tagging is deliberately NOT here: every real caller (CreateBucket,
+	// PutBucketTagging, PutObjectTagging) stores under the constant
+	// tagHdr = "X-Amz-Tagging", which is in droppedKeys, so both bucket- and
+	// object-level tagging are accepted-and-dropped in this v1 scope. A literal
+	// "tagging" entry here would be dead code that never matches a caller.
 	"acl":       true,
 	"ownership": true,
-	"tagging":   true,
 }
 
 // droppedKeys are object attributes that Otter v1 deliberately does NOT persist
@@ -153,7 +158,7 @@ var descKeys = map[string]bool{
 // would fail every qualifying PUT. If these features enter scope, reject at the
 // operation layer instead.
 var droppedKeys = map[string]bool{
-	"X-Amz-Tagging":     true, // object tagging (tagHdr)
+	"X-Amz-Tagging":     true, // bucket + object tagging (tagHdr)
 	"object-retention":  true, // WORM retention (objectRetentionKey)
 	"object-legal-hold": true, // WORM legal hold (objectLegalHoldKey)
 	"checksums":         true, // retrievable stored checksum (checksumsKey)
@@ -175,11 +180,15 @@ func NewAf2Desc(maxValueBytes int) *Af2Desc {
 	}
 }
 
-func (a *Af2Desc) shardFor(path string) *sync.Mutex {
+func (a *Af2Desc) shardIdx(path string) uint32 {
 	h := fnv.New32a()
 	// hash.Write never returns an error.
 	_, _ = h.Write([]byte(path))
-	return &a.shards[h.Sum32()%descShards]
+	return h.Sum32() % descShards
+}
+
+func (a *Af2Desc) shardFor(path string) *sync.Mutex {
+	return &a.shards[a.shardIdx(path)]
 }
 
 // entry returns the cache entry for path, creating an empty one if absent. The
@@ -430,9 +439,33 @@ func (a *Af2Desc) ListAttributes(bucket, object string) ([]string, error) {
 
 // RenameObject moves the cached entry from oldObject to newObject. The DESC
 // xattr itself follows the inode across a rename, so there is no filesystem op.
+//
+// The cache move takes both paths' shard locks before mu, honoring the type's
+// documented lock order (shard lock first, then mu, never the reverse). Holding
+// the shard locks serializes the move against any concurrent StoreAttribute /
+// DeleteAttribute on either path, which hold their path's shard lock for their
+// whole critical section — so a rename cannot interleave with a write and
+// resurrect or drop an entry. The two shards are locked lowest-index-first so
+// two concurrent renames cannot deadlock; when both paths map to the same shard
+// it is locked once (a sync.Mutex is not reentrant).
 func (a *Af2Desc) RenameObject(bucket, oldObject, newObject string) error {
 	oldPath := filepath.Join(bucket, oldObject)
 	newPath := filepath.Join(bucket, newObject)
+
+	oi, ni := a.shardIdx(oldPath), a.shardIdx(newPath)
+	if oi == ni {
+		a.shards[oi].Lock()
+		defer a.shards[oi].Unlock()
+	} else {
+		lo, hi := oi, ni
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		a.shards[lo].Lock()
+		defer a.shards[lo].Unlock()
+		a.shards[hi].Lock()
+		defer a.shards[hi].Unlock()
+	}
 
 	a.mu.Lock()
 	if e, ok := a.cache[oldPath]; ok {
