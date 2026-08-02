@@ -134,6 +134,12 @@ func runOtter(ctx *cli.Context) error {
 	if af2Desc {
 		ms = meta.NewAf2Desc(af2DescMaxBytes)
 	} else {
+		// Match runPosix: probe xattr support up front so a mount that cannot
+		// store xattrs fails at startup with a clear error instead of surfacing
+		// a raw ENOTSUP per-object on the first PUT/HEAD.
+		if err := (meta.XattrMeta{}).Test(gwroot); err != nil {
+			return fmt.Errorf("xattr check failed: %w", err)
+		}
 		ms = meta.XattrMeta{}
 	}
 	opts := posix.PosixOpts{
