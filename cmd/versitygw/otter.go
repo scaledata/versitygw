@@ -160,14 +160,14 @@ func runOtter(ctx *cli.Context) error {
 	}
 
 	// Forward-leg credentials come from the environment (kept off the command
-	// line and out of the shared owner-map file).
+	// line and out of the shared owner-map file). Refuse to start with default/
+	// well-known credentials: a silent fallback would let a misconfigured node
+	// forward with publicly-known keys. Only required when this node can actually
+	// forward — a single-node deployment (n==1) has no peers to sign for.
 	access := os.Getenv("ROOT_ACCESS_KEY")
 	secret := os.Getenv("ROOT_SECRET_KEY")
-	if access == "" {
-		access = "otter"
-	}
-	if secret == "" {
-		secret = "ottersecret"
+	if om.N > 1 && (access == "" || secret == "") {
+		return fmt.Errorf("otter: ROOT_ACCESS_KEY and ROOT_SECRET_KEY must both be set for multi-node forwarding (owner map n=%d); refusing to start with default credentials", om.N)
 	}
 	const region = "us-east-1"
 
