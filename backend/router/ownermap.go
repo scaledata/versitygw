@@ -1,5 +1,7 @@
-// Package router implements Otter multi-node write distribution. See
-// otter-notes/.plans/otter-multinode-distribution-design.md for the design.
+// Package router implements Otter multi-node write distribution: it routes each
+// object verb to the slot/owner computed from the object key, writing locally
+// when this node owns the object and forwarding to the owner's gateway
+// otherwise. See the Router type doc for the invariants.
 package router
 
 import (

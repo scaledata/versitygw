@@ -336,6 +336,17 @@ func (r *Router) GetObjectLegalHold(ctx context.Context, bucket, object, version
 // BucketNotEmpty) still surface; idempotent ones (already-exists / no-such-bucket)
 // are swallowed.
 
+// forwardCtx bounds a fanned-out bucket op with forwardTimeout, mirroring the
+// byte-write forward path, so a partitioned or slow peer fails fast instead of
+// hanging the whole cluster-wide CreateBucket/DeleteBucket on the caller's
+// (possibly unbounded) context. Returns a no-op cancel when no timeout is set.
+func (r *Router) forwardCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if r.forwardTimeout > 0 {
+		return context.WithTimeout(ctx, r.forwardTimeout)
+	}
+	return ctx, func() {}
+}
+
 func (r *Router) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, defaultACL []byte) error {
 	err := r.local.CreateBucket(ctx, in, defaultACL)
 	if isBucketExists(err) {
@@ -348,7 +359,10 @@ func (r *Router) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, def
 		if i == r.selfIdx || p == nil {
 			continue
 		}
-		if e := p.CreateBucket(ctx, in, defaultACL); e != nil && !isBucketExists(e) {
+		pctx, cancel := r.forwardCtx(ctx)
+		e := p.CreateBucket(pctx, in, defaultACL)
+		cancel()
+		if e != nil && !isBucketExists(e) {
 			return fmt.Errorf("router: create bucket on slot %d: %w", i, e)
 		}
 	}
@@ -367,7 +381,10 @@ func (r *Router) DeleteBucket(ctx context.Context, bucket string) error {
 		if i == r.selfIdx || p == nil {
 			continue
 		}
-		if e := p.DeleteBucket(ctx, bucket); e != nil && !isNoSuchBucket(e) {
+		pctx, cancel := r.forwardCtx(ctx)
+		e := p.DeleteBucket(pctx, bucket)
+		cancel()
+		if e != nil && !isNoSuchBucket(e) {
 			return fmt.Errorf("router: delete bucket on slot %d: %w", i, e)
 		}
 	}
@@ -396,7 +413,34 @@ func isNoSuchBucket(err error) bool {
 	if errors.As(err, &apiErr) && apiErr.Code == s3err.GetAPIError(s3err.ErrNoSuchBucket).Code {
 		return true
 	}
-	return strings.Contains(err.Error(), "NoSuchBucket")
+	// A forwarded peer error arrives as an SDK error string carrying the S3
+	// code. Match "NoSuchBucket" at a code boundary so the distinct code
+	// "NoSuchBucketPolicy" (and any future NoSuchBucket* code) is not
+	// misclassified as an idempotent already-gone and silently swallowed.
+	return hasS3Code(err.Error(), "NoSuchBucket")
+}
+
+// hasS3Code reports whether msg contains code as a whole S3 error code, i.e. not
+// immediately followed by another code character. This distinguishes "NoSuchBucket"
+// from the longer, unrelated "NoSuchBucketPolicy" when matching forwarded SDK
+// error strings.
+func hasS3Code(msg, code string) bool {
+	from := 0
+	for {
+		i := strings.Index(msg[from:], code)
+		if i < 0 {
+			return false
+		}
+		end := from + i + len(code)
+		if end >= len(msg) || !isCodeChar(msg[end]) {
+			return true
+		}
+		from = end
+	}
+}
+
+func isCodeChar(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
 }
 
 // NOTE (v1 limitations, delegated to the local backend via embedding):
