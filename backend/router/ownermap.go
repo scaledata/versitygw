@@ -50,6 +50,13 @@ func LoadOwnerMap(path string) (*OwnerMap, error) {
 	}
 	seenEndpoint := make(map[string]bool, m.N)
 	for i, s := range m.Slots {
+		// Routing uses array position as the slot index (place() returns an
+		// index into Slots), so a per-slot "slot" field that disagrees with its
+		// position would silently misroute every object that hashes there. Catch
+		// a misordered/misnumbered owner-map file at load instead.
+		if s.Slot != i {
+			return nil, fmt.Errorf("owner map: slot at position %d declares slot=%d — slots must be in ascending order matching their index", i, s.Slot)
+		}
 		if s.Endpoint == "" {
 			return nil, fmt.Errorf("owner map: slot %d (%q) has an empty endpoint", i, s.NodeId)
 		}

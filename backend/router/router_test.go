@@ -16,6 +16,8 @@ package router
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -104,6 +106,33 @@ func TestCreateBucketFanOutAndEcho(t *testing.T) {
 	}
 	if q1.creates != 0 || q2.creates != 0 {
 		t.Fatalf("echo must not re-fan, got q1=%d q2=%d", q1.creates, q2.creates)
+	}
+}
+
+func TestLoadOwnerMapSlotIndex(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "owner.json")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		return p
+	}
+
+	// slot fields disagree with array position -> rejected.
+	misordered := `{"epoch":1,"n":2,"slots":[
+		{"slot":1,"nodeId":"b","endpoint":"10.0.0.2:9000","channelPath":"/c1"},
+		{"slot":0,"nodeId":"a","endpoint":"10.0.0.1:9000","channelPath":"/c0"}]}`
+	if _, err := LoadOwnerMap(write(t, misordered)); err == nil {
+		t.Fatal("misordered slot indices should be rejected")
+	}
+
+	// slot fields match position -> accepted.
+	ordered := `{"epoch":1,"n":2,"slots":[
+		{"slot":0,"nodeId":"a","endpoint":"10.0.0.1:9000","channelPath":"/c0"},
+		{"slot":1,"nodeId":"b","endpoint":"10.0.0.2:9000","channelPath":"/c1"}]}`
+	if _, err := LoadOwnerMap(write(t, ordered)); err != nil {
+		t.Fatalf("well-formed owner map rejected: %v", err)
 	}
 }
 
