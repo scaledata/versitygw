@@ -165,34 +165,53 @@ func place(bucket, key string, n int) int {
 // whole operation (including body transfer) completes within the backend call;
 // it is deliberately NOT applied to reads, whose response body streams after the
 // call returns (cancelling there would truncate the body).
-func (r *Router) enterWrite(ctx context.Context, local bool) (context.Context, func()) {
+func (r *Router) enterWrite(ctx context.Context, local bool) (context.Context, func(), error) {
 	if local {
-		r.chanSem <- struct{}{}
-		return ctx, func() { <-r.chanSem }
+		// Acquire the per-channel semaphore, but honor context cancellation: a
+		// client that has already disconnected, or whose request deadline has
+		// fired, fails fast instead of blocking behind an in-flight — or wedged —
+		// local write and piling goroutines onto a stuck channel. The forwarded
+		// path is bounded by forwardTimeout below; this is its local equivalent.
+		select {
+		case r.chanSem <- struct{}{}:
+			return ctx, func() { <-r.chanSem }, nil
+		case <-ctx.Done():
+			return ctx, func() {}, ctx.Err()
+		}
 	}
 	if r.forwardTimeout > 0 {
-		return context.WithTimeout(ctx, r.forwardTimeout)
+		c, cancel := context.WithTimeout(ctx, r.forwardTimeout)
+		return c, cancel, nil
 	}
-	return ctx, func() {}
+	return ctx, func() {}, nil
 }
 
 func (r *Router) PutObject(ctx context.Context, in s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
 	be, local := r.pick(*in.Bucket, *in.Key)
-	ctx, done := r.enterWrite(ctx, local)
+	ctx, done, err := r.enterWrite(ctx, local)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
 	defer done()
 	return be.PutObject(ctx, in)
 }
 
 func (r *Router) UploadPart(ctx context.Context, in *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
 	be, local := r.pick(*in.Bucket, *in.Key)
-	ctx, done := r.enterWrite(ctx, local)
+	ctx, done, err := r.enterWrite(ctx, local)
+	if err != nil {
+		return nil, err
+	}
 	defer done()
 	return be.UploadPart(ctx, in)
 }
 
 func (r *Router) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
 	be, local := r.pick(*in.Bucket, *in.Key)
-	ctx, done := r.enterWrite(ctx, local)
+	ctx, done, err := r.enterWrite(ctx, local)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
+	}
 	defer done()
 	return be.CompleteMultipartUpload(ctx, in)
 }
@@ -201,14 +220,20 @@ func (r *Router) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMul
 // v1 limitation (the local backend reads the source locally); WAL never uses them.
 func (r *Router) UploadPartCopy(ctx context.Context, in *s3.UploadPartCopyInput) (s3response.CopyPartResult, error) {
 	be, local := r.pick(*in.Bucket, *in.Key)
-	ctx, done := r.enterWrite(ctx, local)
+	ctx, done, err := r.enterWrite(ctx, local)
+	if err != nil {
+		return s3response.CopyPartResult{}, err
+	}
 	defer done()
 	return be.UploadPartCopy(ctx, in)
 }
 
 func (r *Router) CopyObject(ctx context.Context, in s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
 	be, local := r.pick(*in.Bucket, *in.Key)
-	ctx, done := r.enterWrite(ctx, local)
+	ctx, done, err := r.enterWrite(ctx, local)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, err
+	}
 	defer done()
 	return be.CopyObject(ctx, in)
 }
