@@ -369,11 +369,15 @@ func (a *Af2Desc) DeleteAttribute(bucket, object, attribute string) error {
 			err = xattr.Set(path, descXattrName, blob)
 		}
 	}
-	// ENOATTR/ENOTSUP => nothing was (or could be) persisted; the cache deletion
-	// stands and we report success. On any real error, revert the cache so it
-	// stays consistent with disk (reads are cache-authoritative), matching
-	// StoreAttribute's revert-on-failure behavior.
-	if errors.Is(err, xattr.ENOATTR) || errors.Is(err, syscall.ENOTSUP) {
+	// ENOATTR/ENOTSUP/ENOENT => nothing is (or can be) persisted: no blob was
+	// ever written, the filesystem cannot store xattrs, or the object file has
+	// already been unlinked by the caller. The cache deletion stands and we
+	// report success. On any real error, revert the cache so it stays consistent
+	// with disk (reads are cache-authoritative), matching StoreAttribute's
+	// revert-on-failure behavior.
+	if errors.Is(err, xattr.ENOATTR) ||
+		errors.Is(err, syscall.ENOTSUP) ||
+		errors.Is(err, syscall.ENOENT) {
 		return nil
 	}
 	if err != nil {
@@ -395,7 +399,16 @@ func (a *Af2Desc) DeleteAttributes(bucket, object string) error {
 	a.mu.Unlock()
 
 	err := xattr.Remove(path, descXattrName)
-	if errors.Is(err, xattr.ENOATTR) || errors.Is(err, syscall.ENOTSUP) {
+	// ENOATTR: no blob was ever written. ENOTSUP: the filesystem cannot store
+	// xattrs. ENOENT: the object's data file was already unlinked by the caller
+	// — backend/posix DeleteObject removes the data file and only then calls
+	// DeleteAttributes, so the DESC xattr is already gone with it, which is
+	// exactly the desired post-condition. The cache entry is cleared above in
+	// every case, so report success; this mirrors XattrMeta.DeleteAttributes
+	// being a documented no-op because xattrs are removed with the file.
+	if errors.Is(err, xattr.ENOATTR) ||
+		errors.Is(err, syscall.ENOTSUP) ||
+		errors.Is(err, syscall.ENOENT) {
 		return nil
 	}
 	return mapXattrErr(err)

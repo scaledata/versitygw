@@ -277,6 +277,51 @@ func TestAf2DescDelete(t *testing.T) {
 	}
 }
 
+// TestAf2DescDeleteAfterUnlink mirrors backend/posix DeleteObject's real call
+// order: the object's data file is unlinked before the metadata storer is asked
+// to drop the DESC. The path-based xattr.Remove/Set then fails with ENOENT;
+// both delete methods must treat that as success (the DESC is already gone with
+// the file) rather than surfacing a raw error that would fail every
+// DeleteObject under --af2-desc.
+func TestAf2DescDeleteAfterUnlink(t *testing.T) {
+	t.Run("DeleteAttributes", func(t *testing.T) {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "o")
+		f := mustCreate(t, p)
+		s := NewAf2Desc(0)
+		_ = s.StoreAttribute(f, dir, "o", "etag", []byte("E"))
+
+		if err := os.Remove(p); err != nil {
+			t.Fatalf("unlink object file: %v", err)
+		}
+		if err := s.DeleteAttributes(dir, "o"); err != nil {
+			t.Fatalf("DeleteAttributes after unlink: %v", err)
+		}
+	})
+
+	t.Run("DeleteAttribute", func(t *testing.T) {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "o")
+		f := mustCreate(t, p)
+		s := NewAf2Desc(0)
+		_ = s.StoreAttribute(f, dir, "o", "etag", []byte("E"))
+		_ = s.StoreAttribute(f, dir, "o", "content-type", []byte("text/plain"))
+
+		if err := os.Remove(p); err != nil {
+			t.Fatalf("unlink object file: %v", err)
+		}
+		// Removing one of several attributes takes the xattr.Set branch, which
+		// also fails ENOENT on the unlinked path and must be tolerated.
+		if err := s.DeleteAttribute(dir, "o", "content-type"); err != nil {
+			t.Fatalf("DeleteAttribute (set branch) after unlink: %v", err)
+		}
+		// Removing the last attribute takes the xattr.Remove branch.
+		if err := s.DeleteAttribute(dir, "o", "etag"); err != nil {
+			t.Fatalf("DeleteAttribute (remove branch) after unlink: %v", err)
+		}
+	})
+}
+
 // TestAf2DescListAttributesEmpty: ListAttributes returns no keys by design.
 func TestAf2DescListAttributesEmpty(t *testing.T) {
 	dir := t.TempDir()
