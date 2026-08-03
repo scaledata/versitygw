@@ -89,6 +89,27 @@ type Af2Desc struct {
 	shards []sync.Mutex
 
 	maxLen int
+
+	// Rootdir anchors the path-based (nil-fd) xattr syscalls at an absolute
+	// gateway root, mirroring XattrMeta.Rootdir and Posix.rooted. Since the
+	// posix backend no longer chdir's into the root, a bare bucket/object would
+	// otherwise resolve against the process CWD. The in-memory cache key stays
+	// the relative filepath.Join(bucket, object) regardless, so fd-based and
+	// path-based calls for the same object share one entry. Empty means "not
+	// rooted" (join as-is) — the correct default for the fd-only unit tests and
+	// any caller that already passes absolute paths.
+	Rootdir string
+}
+
+// rooted resolves the on-disk path for a path-based xattr syscall. It mirrors
+// XattrMeta.rooted: if Rootdir is unset, or bucket is already absolute (e.g. a
+// versionPath), it joins as-is; otherwise it prepends Rootdir. Only the disk
+// path is rooted — callers keep filepath.Join(bucket, object) as the cache key.
+func (a *Af2Desc) rooted(bucket, object string) string {
+	if a.Rootdir == "" || filepath.IsAbs(bucket) {
+		return filepath.Join(bucket, object)
+	}
+	return filepath.Join(a.Rootdir, bucket, object)
 }
 
 type descEntry struct {
@@ -303,7 +324,7 @@ func (a *Af2Desc) StoreAttribute(f *os.File, bucket, object, attribute string, v
 		if f != nil {
 			err = xattr.FSet(f, descXattrName, blob)
 		} else {
-			err = xattr.Set(path, descXattrName, blob)
+			err = xattr.Set(a.rooted(bucket, object), descXattrName, blob)
 		}
 		if err != nil {
 			a.revert(e, attribute, prev, had)
@@ -346,7 +367,7 @@ func (a *Af2Desc) RetrieveAttribute(f *os.File, bucket, object, attribute string
 	// read the full on-disk blob), so a missing key means ErrNoSuchKey. Only a
 	// cold (empty) entry falls back to disk.
 	if len(e.m) == 0 {
-		if m, err := readBlob(f, path); err == nil {
+		if m, err := readBlob(f, a.rooted(bucket, object)); err == nil {
 			e.m = m
 			// Record the inode alongside the cold-filled map. Without this the
 			// entry's ino stays 0, and the next fd-based StoreAttribute would see
@@ -376,14 +397,15 @@ func (a *Af2Desc) DeleteAttribute(bucket, object, attribute string) error {
 	prev, had := e.m[attribute]
 	delete(e.m, attribute)
 
+	diskPath := a.rooted(bucket, object)
 	var err error
 	if len(e.m) == 0 {
-		err = xattr.Remove(path, descXattrName)
+		err = xattr.Remove(diskPath, descXattrName)
 	} else {
 		var blob []byte
 		blob, err = json.Marshal(e.m)
 		if err == nil {
-			err = xattr.Set(path, descXattrName, blob)
+			err = xattr.Set(diskPath, descXattrName, blob)
 		}
 	}
 	// ENOATTR/ENOTSUP/ENOENT => nothing is (or can be) persisted: no blob was
@@ -415,7 +437,7 @@ func (a *Af2Desc) DeleteAttributes(bucket, object string) error {
 	delete(a.cache, path)
 	a.mu.Unlock()
 
-	err := xattr.Remove(path, descXattrName)
+	err := xattr.Remove(a.rooted(bucket, object), descXattrName)
 	// ENOATTR: no blob was ever written. ENOTSUP: the filesystem cannot store
 	// xattrs. ENOENT: the object's data file was already unlinked by the caller
 	// — backend/posix DeleteObject removes the data file and only then calls

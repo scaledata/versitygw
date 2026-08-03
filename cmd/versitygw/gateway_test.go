@@ -62,7 +62,7 @@ func initPosix(ctx context.Context) {
 		log.Fatalf("make temp directory: %v", err)
 	}
 
-	be, err := posix.New(tempdir, meta.XattrMeta{}, posix.PosixOpts{
+	be, err := posix.New(tempdir, meta.XattrMeta{Rootdir: tempdir}, posix.PosixOpts{
 		NewDirPerm:  0755,
 		Concurrency: 5000,
 	})

@@ -223,11 +223,23 @@ func runOtter(ctx *cli.Context) error {
 	var ms meta.MetadataStorer
 	if af2Desc {
 		desc := meta.NewAf2Desc(af2DescMaxBytes)
+		gwrootAbs, err := filepath.Abs(gwroot)
+		if err != nil {
+			return fmt.Errorf("get absolute path of %v: %w", gwroot, err)
+		}
+		// Root path-based DESC xattr syscalls at the absolute gateway root; the
+		// backend no longer chdir's, so a bare bucket/object would resolve
+		// against the process CWD (mirrors the XattrMeta.Rootdir wiring below).
+		desc.Rootdir = gwrootAbs
 		if err := maybeWarmCache(desc, gwroot); err != nil {
 			return err
 		}
 		ms = desc
 	} else {
+		gwrootAbs, err := filepath.Abs(gwroot)
+		if err != nil {
+			return fmt.Errorf("get absolute path of %v: %w", gwroot, err)
+		}
 		// The warm flags only take effect under --af2-desc; warn if set without
 		// it so this precondition failure isn't silent.
 		if af2WarmNodeIP != "" || af2WarmUniqueID != "" || af2WarmPartitionID >= 0 {
@@ -239,12 +251,12 @@ func runOtter(ctx *cli.Context) error {
 		if err := (meta.XattrMeta{}).Test(gwroot); err != nil {
 			return fmt.Errorf("xattr check failed: %w", err)
 		}
-		ms = meta.XattrMeta{}
+		ms = meta.XattrMeta{Rootdir: gwrootAbs}
 	}
 	opts := posix.PosixOpts{
-		NewDirPerm:          fs.FileMode(dirPerms),
-		ForceNoTmpFile:      forceNoTmpFile,
-		SameDirTmp:          sameDirTmp,
+		NewDirPerm:     fs.FileMode(dirPerms),
+		ForceNoTmpFile: forceNoTmpFile,
+		SameDirTmp:     sameDirTmp,
 		// The otter deployment is the AF2 write-at-offset backend, so it selects
 		// the Af2 MPU handler explicitly. This is decoupled from SameDirTmp (which
 		// is only the cross-dir-rename fix) so the two concerns stay independent.
