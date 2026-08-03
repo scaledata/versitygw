@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/urfave/cli/v2"
@@ -33,6 +34,16 @@ var (
 	ownerMapFile   string
 	selfIdxFlag    int
 	forwardTimeout time.Duration
+
+	// af2Warm* flags enable WarmCache at startup: pre-populate the Af2Desc
+	// metadata cache from af2GetPartitionMetadata so GET/HEAD returns correct
+	// metadata even on a cold cache after a restart. Set node-ip, id, and
+	// partition-id together to enable it.
+	af2WarmNodeIP      string
+	af2WarmUniqueID    string
+	af2WarmPartitionID int
+	af2WarmCertFile    string
+	af2WarmKeyFile     string
 )
 
 func otterCommand() *cli.Command {
@@ -93,6 +104,39 @@ as the argument and the shared owner map via --owner-map.`,
 				EnvVars:     []string{"VGW_DISABLE_OTMP"},
 				Destination: &forceNoTmpFile,
 			},
+			// af2GetPartitionMetadata warm-up flags. Set node-ip, id, and
+			// partition-id together to enable WarmCache at startup.
+			&cli.StringFlag{
+				Name:        "af2-warm-node-ip",
+				Usage:       "IP of the CDM node running the AF2/kvsnapshot service (usually 127.0.0.1); with --af2-warm-id/--af2-warm-partition-id, warms the metadata cache at startup",
+				EnvVars:     []string{"OTTER_AF2_WARM_NODE_IP"},
+				Destination: &af2WarmNodeIP,
+			},
+			&cli.StringFlag{
+				Name:        "af2-warm-id",
+				Usage:       "AF2 unique ID (UUID) for this channel's partition (from Kosmos data_path_spec)",
+				EnvVars:     []string{"OTTER_AF2_WARM_ID"},
+				Destination: &af2WarmUniqueID,
+			},
+			&cli.IntFlag{
+				Name:        "af2-warm-partition-id",
+				Usage:       "AF2 partition ID for this channel (from Kosmos data_path_spec)",
+				EnvVars:     []string{"OTTER_AF2_WARM_PARTITION_ID"},
+				Value:       -1,
+				Destination: &af2WarmPartitionID,
+			},
+			&cli.StringFlag{
+				Name:        "af2-warm-cert",
+				Usage:       "mTLS cluster certificate for kvsnapshot (default: /var/lib/rubrik/certs/cluster.crt)",
+				EnvVars:     []string{"OTTER_AF2_WARM_CERT"},
+				Destination: &af2WarmCertFile,
+			},
+			&cli.StringFlag{
+				Name:        "af2-warm-key",
+				Usage:       "mTLS cluster key for kvsnapshot (default: /var/lib/rubrik/certs/cluster.pem)",
+				EnvVars:     []string{"OTTER_AF2_WARM_KEY"},
+				Destination: &af2WarmKeyFile,
+			},
 			&cli.IntFlag{
 				Name:        "concurrency",
 				Usage:       "maximum concurrent actions allowed on the local backend",
@@ -109,6 +153,52 @@ as the argument and the shared owner map via --owner-map.`,
 			},
 		},
 	}
+}
+
+// maybeWarmCache runs Af2Desc.WarmCache when all three warm flags are provided.
+// Partial configuration (some but not all) is surfaced loudly rather than
+// silently skipped, and the partition-id is bounds-checked before narrowing to
+// int16. WarmCache itself is best-effort (logged, non-fatal); only a
+// misconfiguration returns an error.
+func maybeWarmCache(desc *meta.Af2Desc, gwroot string) error {
+	nSet := 0
+	if af2WarmNodeIP != "" {
+		nSet++
+	}
+	if af2WarmUniqueID != "" {
+		nSet++
+	}
+	if af2WarmPartitionID >= 0 {
+		nSet++
+	}
+	switch {
+	case nSet == 0:
+		return nil // warm not requested
+	case nSet < 3:
+		fmt.Fprintf(os.Stderr, "warn: --af2-warm-* partially configured (%d/3 set); skipping WarmCache. Set --af2-warm-node-ip, --af2-warm-id and --af2-warm-partition-id together.\n", nSet)
+		return nil
+	}
+
+	if af2WarmPartitionID > math.MaxInt16 {
+		return fmt.Errorf("--af2-warm-partition-id %d exceeds the AF2 partition-id range (max %d)", af2WarmPartitionID, math.MaxInt16)
+	}
+
+	// AF2 reports absolute file_paths; WarmCache strips channelPath as an exact
+	// string prefix to derive relative cache keys, so pass the absolute, cleaned
+	// gwroot. It must be the canonical mount path AF2 walks — a relative path or
+	// stray trailing slash would make every key miss and warming a silent no-op.
+	gwrootAbs, err := filepath.Abs(gwroot)
+	if err != nil {
+		return fmt.Errorf("resolve gwroot %q to absolute: %w", gwroot, err)
+	}
+
+	if err := desc.WarmCache(af2WarmNodeIP, af2WarmUniqueID, gwrootAbs,
+		int16(af2WarmPartitionID), af2WarmCertFile, af2WarmKeyFile); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: WarmCache failed (pre-restart metadata unavailable): %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "info: WarmCache complete\n")
+	}
+	return nil
 }
 
 func runOtter(ctx *cli.Context) error {
@@ -132,8 +222,17 @@ func runOtter(ctx *cli.Context) error {
 	// Local AF2 channel backend (DESC metadata + same-dir-tmp for SDFS).
 	var ms meta.MetadataStorer
 	if af2Desc {
-		ms = meta.NewAf2Desc(af2DescMaxBytes)
+		desc := meta.NewAf2Desc(af2DescMaxBytes)
+		if err := maybeWarmCache(desc, gwroot); err != nil {
+			return err
+		}
+		ms = desc
 	} else {
+		// The warm flags only take effect under --af2-desc; warn if set without
+		// it so this precondition failure isn't silent.
+		if af2WarmNodeIP != "" || af2WarmUniqueID != "" || af2WarmPartitionID >= 0 {
+			fmt.Fprintf(os.Stderr, "warn: --af2-warm-* flags are set but --af2-desc is not; WarmCache will not run\n")
+		}
 		// Match runPosix: probe xattr support up front so a mount that cannot
 		// store xattrs fails at startup with a clear error instead of surfacing
 		// a raw ENOTSUP per-object on the first PUT/HEAD.

@@ -1690,6 +1690,17 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("create upload temp dir: %w", err)
 	}
 
+	// SDFS rejects setxattr on a directory (the generic path below stores the
+	// object name + content-type/user-meta/lock as DESC xattrs on the upload-id
+	// *directory*, which returns EINVAL on SDFS and 500s every MPU init). The
+	// Af2 handler persists objname + content-type/user-meta as plain files
+	// instead, so when it is active we skip the generic directory-xattr writes
+	// and delegate straight to it. (Matches otter-v2; see
+	// otter-scaledata-mpu-create-desc-bug.)
+	if _, ok := p.mpuHandler.(Af2MPUHandler); ok {
+		return p.mpuHandler.CreateMultipartUpload(ctx, p, mpu, bucket, object, uploadID)
+	}
+
 	// set an attribute with the original object name so that we can
 	// map the hashed name back to the original object name
 	err = p.meta.StoreAttribute(nil, bucket, objdir, onameAttr, []byte(object))
@@ -5919,7 +5930,12 @@ func (p *Posix) ListObjectsV2Parametrized(ctx context.Context, input *s3.ListObj
 		ContinuationToken:     backend.GetPtrFromString(marker),
 		NextContinuationToken: backend.GetPtrFromString(results.NextMarker),
 		Prefix:                backend.GetPtrFromString(prefix),
-		StartAfter:            backend.GetPtrFromString(*input.StartAfter),
+		// Echo the request's StartAfter as-is. Must NOT deref unconditionally:
+		// internal callers (the Otter router's LIST fan-out) construct inputs with
+		// a nil StartAfter, and *input.StartAfter would nil-panic. Real client
+		// requests arrive with StartAfter defaulted to &"" by the S3 API layer,
+		// which masked this.
+		StartAfter: input.StartAfter,
 	}, nil
 }
 
