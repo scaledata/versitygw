@@ -24,10 +24,23 @@ import (
 // fakeMPUHandler records which MPUHandler method Posix dispatched to, so the
 // pluggable-strategy seam can be verified without a real backend.
 type fakeMPUHandler struct {
+	createMPU  bool
 	uploadPart bool
 	complete   bool
 	abort      bool
 	listParts  bool
+}
+
+// CreateMultipartUpload satisfies the MPUHandler interface, which this PR
+// extends for the Af2 write-at-offset backend. Posix.CreateMultipartUpload only
+// delegates after an on-disk bucket stat (and, on the generic path, directory
+// xattr writes) that a bare &Posix{} cannot satisfy, and it dispatches to this
+// method solely via a concrete Af2MPUHandler type assertion — so this records
+// dispatch for interface completeness but is not exercised by the bare-Posix
+// dispatch assertions below.
+func (h *fakeMPUHandler) CreateMultipartUpload(_ context.Context, _ *Posix, _ s3response.CreateMultipartUploadInput, _, _, _ string) (s3response.InitiateMultipartUploadResult, error) {
+	h.createMPU = true
+	return s3response.InitiateMultipartUploadResult{}, nil
 }
 
 func (h *fakeMPUHandler) UploadPart(_ context.Context, _ *Posix, _ *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
