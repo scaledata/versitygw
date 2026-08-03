@@ -98,14 +98,14 @@ func newTestRouter(backends ...backend.Backend) *Router {
 	for i := 1; i < n; i++ {
 		peers[i] = backends[i]
 	}
-	return &Router{
-		Backend: backends[0],
+	r := &Router{chanSem: make(chan struct{}, 1)}
+	r.cfg.Store(&routerCfg{
 		local:   backends[0],
 		peers:   peers,
 		selfIdx: 0,
 		n:       n,
-		chanSem: make(chan struct{}, 1),
-	}
+	})
+	return r
 }
 
 func strptr(s string) *string { return &s }
@@ -385,7 +385,8 @@ func TestListV2StartAfter(t *testing.T) {
 // through unchanged).
 func TestListV2SingleChannelPassthrough(t *testing.T) {
 	local := newMock("k1", "k2", "k3")
-	r := &Router{Backend: local, local: local, peers: []backend.Backend{nil}, selfIdx: 0, n: 1, chanSem: make(chan struct{}, 1)}
+	r := &Router{chanSem: make(chan struct{}, 1)}
+	r.cfg.Store(&routerCfg{local: local, peers: []backend.Backend{nil}, selfIdx: 0, n: 1})
 	res, err := r.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{Bucket: strptr("bk")})
 	if err != nil {
 		t.Fatal(err)

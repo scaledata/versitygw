@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -16,11 +17,23 @@ import (
 	"github.com/versity/versitygw/s3response"
 )
 
-// Router is the Otter multi-channel distribution backend. It embeds the
-// node-local backend (so every verb it does not override delegates locally) and
-// routes per-object verbs to the slot/owner computed from the object key:
+// routerCfg is an immutable snapshot of the routing state. Reconfigure swaps it
+// atomically so readers never observe a torn update: pick() and the delegate
+// methods each Load() the pointer once and operate on that snapshot.
+type routerCfg struct {
+	local   backend.Backend   // node-local backend
+	peers   []backend.Backend // len N; peers[selfIdx] is nil (owned locally)
+	selfIdx int
+	n       int
+}
+
+// Router is the Otter multi-channel distribution backend. Verbs it does not
+// override are delegated to the current local backend (see router_delegate.go);
+// per-object verbs are routed to the slot/owner computed from the object key:
 // writes locally if this node owns the object, forwards to the owning node's
-// gateway otherwise.
+// gateway otherwise. The routing state lives in an atomically-swapped cfg
+// snapshot so Reconfigure can install a new local backend / peer set without a
+// lock on the read path.
 //
 // Invariants (see the design doc):
 //   - writer==owner: a forward always targets the AF2 mount-node; the local AF2
@@ -34,15 +47,35 @@ import (
 //   - bounded forwards: a forwarded byte-write is given a deadline so a
 //     partitioned peer fails fast instead of hanging at the OS connect timeout.
 type Router struct {
-	backend.Backend // node-local backend; delegate for any verb not overridden below
-
-	local          backend.Backend   // == embedded Backend, named for clarity at call sites
-	peers          []backend.Backend // len N; peers[selfIdx] is nil (owned locally)
-	selfIdx        int
-	n              int
+	cfg            atomic.Pointer[routerCfg]
 	epoch          int64
 	chanSem        chan struct{} // weight-1: at most one byte-write into the local channel at a time
 	forwardTimeout time.Duration // deadline for a forwarded byte-write (0 = no timeout)
+}
+
+// validateCfg checks a routing configuration. selfIdx may be -1 (this node owns
+// no slot — a pure forwarder); otherwise it must index a slot in [0,n). Shared
+// by New and Reconfigure so a live reconfiguration is validated as strictly as
+// bootstrap, failing fast instead of installing a snapshot that panics pick().
+func validateCfg(local backend.Backend, peers []backend.Backend, selfIdx, n int) error {
+	if local == nil {
+		return fmt.Errorf("router: nil local backend")
+	}
+	if n <= 0 {
+		return fmt.Errorf("router: n must be > 0, got %d", n)
+	}
+	if len(peers) != n {
+		return fmt.Errorf("router: have %d peer backends but n=%d", len(peers), n)
+	}
+	if selfIdx != -1 && (selfIdx < 0 || selfIdx >= n) {
+		return fmt.Errorf("router: selfIdx %d out of range [0,%d) (or -1 for a pure forwarder)", selfIdx, n)
+	}
+	for i := range peers {
+		if i != selfIdx && peers[i] == nil {
+			return fmt.Errorf("router: peers[%d] is nil but it is not the local slot", i)
+		}
+	}
+	return nil
 }
 
 // New builds a Router. selfIdx is this node's slot (supplied per-node as a flag).
@@ -50,43 +83,92 @@ type Router struct {
 // written through local), and every other entry must be a forwarding backend to
 // that slot's gateway. forwardTimeout bounds a forwarded byte-write (0 disables).
 func New(local backend.Backend, peers []backend.Backend, m *OwnerMap, selfIdx int, forwardTimeout time.Duration) (*Router, error) {
-	if local == nil {
-		return nil, fmt.Errorf("router: nil local backend")
+	if err := validateCfg(local, peers, selfIdx, m.N); err != nil {
+		return nil, err
 	}
-	if selfIdx < 0 || selfIdx >= m.N {
-		return nil, fmt.Errorf("router: selfIdx %d out of range [0,%d)", selfIdx, m.N)
-	}
-	if len(peers) != m.N {
-		return nil, fmt.Errorf("router: have %d peer backends but owner map n=%d", len(peers), m.N)
-	}
-	for i := range peers {
-		if i != selfIdx && peers[i] == nil {
-			return nil, fmt.Errorf("router: peers[%d] is nil but it is not the local slot", i)
-		}
-	}
-	return &Router{
-		Backend:        local,
-		local:          local,
-		peers:          peers,
-		selfIdx:        selfIdx,
-		n:              m.N,
+	r := &Router{
 		epoch:          m.Epoch,
 		chanSem:        make(chan struct{}, 1),
 		forwardTimeout: forwardTimeout,
-	}, nil
+	}
+	r.cfg.Store(&routerCfg{
+		local:   local,
+		peers:   peers,
+		selfIdx: selfIdx,
+		n:       m.N,
+	})
+	return r, nil
+}
+
+// reconfigureDrainTimeout bounds how long Reconfigure waits to drain an
+// in-flight local write before giving up, so a wedged backend cannot hang a
+// handoff indefinitely.
+const reconfigureDrainTimeout = 30 * time.Second
+
+// Reconfigure atomically installs a new local backend and peer slice.
+// chanSem is acquired to drain any in-flight local byte-write first (P=1 invariant).
+// Reads (GetObject etc.) are lock-free — they load a snapshot once per request
+// and operate on it; both old and new snapshots are valid concurrently.
+// newSelfIdx is this node's owned slot in the new configuration, or -1 if this
+// node owns no slot (a pure forwarder). It must be set from the grant, not
+// preserved from the bootstrap config: in deploy mode the owned slot is selected
+// by --self-node-id (matching a slot's NodeID), so the bootstrap selfIdx (0) is
+// unrelated to the real slot. A stale selfIdx makes pick() route objects hashing
+// to that slot at the local backend — which for a forwarder has no bucket dir
+// (404 NoSuchBucket) and for a mis-indexed owner dereferences a nil peer.
+// selfIdx == -1 never equals any place() result, so every object forwards.
+func (r *Router) Reconfigure(ctx context.Context, newLocal backend.Backend, newPeers []backend.Backend, newSelfIdx, newN int) error {
+	if err := validateCfg(newLocal, newPeers, newSelfIdx, newN); err != nil {
+		return err
+	}
+
+	// Drain in-flight local byte-writes (P=1) before swapping, but bound the
+	// wait: a wedged local backend is the likely reason for a regrant, and an
+	// unbounded acquire here would hang the very handoff meant to move traffic
+	// off the unhealthy node. NOTE: acquiring chanSem does not by itself close
+	// the pick()-before-enterWrite() window that can still land a stale write on
+	// the old backend — that is tracked separately; this only bounds the wait.
+	dctx, cancel := context.WithTimeout(ctx, reconfigureDrainTimeout)
+	defer cancel()
+	select {
+	case r.chanSem <- struct{}{}:
+		defer func() { <-r.chanSem }()
+	case <-dctx.Done():
+		return fmt.Errorf("router: reconfigure timed out draining in-flight local write: %w", dctx.Err())
+	}
+
+	old := r.cfg.Load()
+	r.cfg.Store(&routerCfg{
+		local:   newLocal,
+		peers:   newPeers,
+		selfIdx: newSelfIdx,
+		n:       newN,
+	})
+
+	// Release the replaced backend's resources (e.g. posix's open root fd) so
+	// repeated ownership handoffs don't leak descriptors toward EMFILE. Skip
+	// when the new config reuses the same instance. (Draining in-flight lock-free
+	// reads on the old backend before Shutdown is part of the pick-window
+	// redesign; Reconfigure has no live caller yet.)
+	if old != nil && old.local != nil && old.local != newLocal {
+		old.local.Shutdown()
+	}
+	return nil
 }
 
 func (r *Router) String() string {
-	return fmt.Sprintf("Otter router (n=%d, self=%d, epoch=%d)", r.n, r.selfIdx, r.epoch)
+	c := r.cfg.Load()
+	return fmt.Sprintf("Otter router (n=%d, self=%d, epoch=%d)", c.n, c.selfIdx, r.epoch)
 }
 
 // pick returns the backend that owns (bucket,key) and whether it is local.
 func (r *Router) pick(bucket, key string) (backend.Backend, bool) {
-	idx := place(bucket, key, r.n)
-	if idx == r.selfIdx {
-		return r.local, true
+	c := r.cfg.Load()
+	idx := place(bucket, key, c.n)
+	if idx == c.selfIdx {
+		return c.local, true
 	}
-	return r.peers[idx], false
+	return c.peers[idx], false
 }
 
 // ---- placement -------------------------------------------------------------
@@ -348,15 +430,16 @@ func (r *Router) forwardCtx(ctx context.Context) (context.Context, context.Cance
 }
 
 func (r *Router) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, defaultACL []byte) error {
-	err := r.local.CreateBucket(ctx, in, defaultACL)
+	c := r.cfg.Load()
+	err := c.local.CreateBucket(ctx, in, defaultACL)
 	if isBucketExists(err) {
 		return nil // already present here (likely a fan-out echo) -> do not re-fan
 	}
 	if err != nil {
 		return err
 	}
-	for i, p := range r.peers {
-		if i == r.selfIdx || p == nil {
+	for i, p := range c.peers {
+		if i == c.selfIdx || p == nil {
 			continue
 		}
 		pctx, cancel := r.forwardCtx(ctx)
@@ -370,15 +453,16 @@ func (r *Router) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, def
 }
 
 func (r *Router) DeleteBucket(ctx context.Context, bucket string) error {
-	err := r.local.DeleteBucket(ctx, bucket)
+	c := r.cfg.Load()
+	err := c.local.DeleteBucket(ctx, bucket)
 	if isNoSuchBucket(err) {
 		return nil // already gone here (echo) -> do not re-fan
 	}
 	if err != nil {
 		return err // e.g. BucketNotEmpty -> surface
 	}
-	for i, p := range r.peers {
-		if i == r.selfIdx || p == nil {
+	for i, p := range c.peers {
+		if i == c.selfIdx || p == nil {
 			continue
 		}
 		pctx, cancel := r.forwardCtx(ctx)
@@ -443,7 +527,7 @@ func isCodeChar(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
 }
 
-// NOTE (v1 limitations, delegated to the local backend via embedding):
+// NOTE (v1 limitations, delegated to the local backend via router_delegate.go):
 //   - DeleteObjects (batch) can span owners; not yet fanned out per-owner.
 //   - ListObjects / ListObjectVersions / ListMultipartUploads are local-only;
 //     a cross-node fan-out+merge is deferred (WAL restore is GET-by-name).

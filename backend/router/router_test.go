@@ -60,7 +60,8 @@ func TestNewValidation(t *testing.T) {
 		wantErr bool
 	}{
 		{"nil local", nil, goodPeers(), 0, true},
-		{"selfIdx negative", local, goodPeers(), -1, true},
+		{"selfIdx -1 pure forwarder", local, goodPeers(), -1, false},
+		{"selfIdx < -1", local, goodPeers(), -2, true},
 		{"selfIdx == N", local, goodPeers(), 3, true},
 		{"peers len mismatch", local, []backend.Backend{local, &fakeBucketBackend{}}, 0, true},
 		{"nil non-self peer", local, []backend.Backend{local, nil, &fakeBucketBackend{}}, 0, true},
