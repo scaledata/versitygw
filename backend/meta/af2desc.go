@@ -17,6 +17,7 @@ package meta
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"os"
 	"path/filepath"
@@ -270,8 +271,15 @@ func (a *Af2Desc) StoreAttribute(f *os.File, bucket, object, attribute string, v
 	e := a.entry(path)
 
 	if f != nil {
-		if ino, ok := inoOf(f); ok && e.ino != ino {
-			e.m = map[string]string{}
+		if ino, ok := inoOf(f); ok {
+			// e.ino == 0 means the entry's inode is unknown: either a brand-new
+			// entry, or one populated by WarmCache/cold-read which had no fd to
+			// stat. Adopt the real inode without wiping — the cached fields are
+			// this object's. Only a *changed* known inode means the object was
+			// replaced (temp-fd + same-dir rename), so reset then.
+			if e.ino != 0 && e.ino != ino {
+				e.m = map[string]string{}
+			}
 			e.ino = ino
 		}
 	}
@@ -435,6 +443,40 @@ func (a *Af2Desc) DeleteAttributes(bucket, object string) error {
 // deployment must revisit this.
 func (a *Af2Desc) ListAttributes(bucket, object string) ([]string, error) {
 	return []string{}, nil
+}
+
+// WarmCache repopulates the in-process metadata cache from AF2 at startup, so
+// GET/HEAD return correct object metadata even on a cold cache after a gateway
+// restart — closing the read-back gap that exists on SDFS, where getxattr is
+// unimplemented and the cache is otherwise the only read path. It calls
+// af2GetPartitionMetadata (over mTLS) on the CDM node at nodeIP and inserts each
+// returned file's DESC fields into the cache, keyed by file_path == bucket/object.
+//
+// Best-effort by contract: the caller logs a non-nil error and continues serving.
+// Objects written after startup are cached normally via StoreAttribute; only
+// read-back of pre-restart objects depends on this warm-up.
+func (a *Af2Desc) WarmCache(nodeIP, af2UniqueID, channelPath string, partitionID int16, certFile, keyFile string) error {
+	descMap, err := GetPartitionDescMap(nodeIP, af2UniqueID, channelPath, partitionID, certFile, keyFile)
+	if err != nil {
+		return fmt.Errorf("WarmCache: getPartitionMetadata failed: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "info: WarmCache loaded %d files with DESC from AF2\n", len(descMap))
+	// Insert per path under its shard lock (taking mu only briefly inside
+	// entry()), rather than holding the whole-cache mu for the entire load.
+	// Holding mu across a large partition load would block every concurrent
+	// GET/HEAD/PUT gateway-wide for the duration — precisely during the
+	// restart-recovery window this warm-up exists to serve.
+	for path, fields := range descMap {
+		sh := a.shardFor(path)
+		sh.Lock()
+		e := a.entry(path)
+		e.m = fields
+		// ino left 0: no local fd here. The first fd-based StoreAttribute adopts
+		// the real inode without wiping these warmed fields (see StoreAttribute).
+		sh.Unlock()
+	}
+	return nil
 }
 
 // RenameObject moves the cached entry from oldObject to newObject. The DESC

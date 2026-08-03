@@ -373,6 +373,43 @@ func TestAf2DescConcurrent(t *testing.T) {
 	}
 }
 
+// TestAf2DescWarmedEntrySurvivesFirstStore covers the WarmCache inode fix: a
+// cache entry populated without a local fd (ino==0, as WarmCache and cold reads
+// do) must not be wiped by the first fd-based StoreAttribute — the real inode is
+// adopted, warmed fields kept. A genuinely changed inode (object replaced) still
+// resets the entry.
+func TestAf2DescWarmedEntrySurvivesFirstStore(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "seg")
+	f := mustCreate(t, p)
+	s := NewAf2Desc(0)
+
+	// Simulate a WarmCache-populated entry: known fields, unknown inode.
+	s.cache[filepath.Join(dir, "seg")] = &descEntry{m: map[string]string{"etag": "WARM"}}
+
+	// First fd-based store of a different attribute must adopt the inode without
+	// wiping the warmed etag.
+	if err := s.StoreAttribute(f, dir, "seg", "content-type", []byte("text/plain")); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if got, err := retr(t, s, dir, "seg", "etag"); err != nil || got != "WARM" {
+		t.Fatalf("warmed etag = %q, %v (must survive first store)", got, err)
+	}
+
+	// A genuine inode change (object replaced at the same path) still wipes.
+	_ = f.Close()
+	if err := os.Remove(p); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	f2 := mustCreate(t, p)
+	if err := s.StoreAttribute(f2, dir, "seg", "etag", []byte("NEW")); err != nil {
+		t.Fatalf("store2: %v", err)
+	}
+	if _, err := retr(t, s, dir, "seg", "content-type"); !errors.Is(err, ErrNoSuchKey) {
+		t.Fatalf("content-type should be wiped by inode change, err=%v", err)
+	}
+}
+
 // TestAf2DescRenameObjectRace exercises RenameObject concurrently with
 // StoreAttribute/RetrieveAttribute on the same old/new paths. It verifies the
 // shard-lock ordering added to RenameObject is deadlock-free and race-clean
