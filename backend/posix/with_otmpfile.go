@@ -18,7 +18,6 @@
 package posix
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -117,8 +116,7 @@ func (p *Posix) openMkTemp(dir, bucket, obj string, size int64, dofalloc bool, u
 		}
 		return nil, fmt.Errorf("make temp dir: %w", err)
 	}
-	f, err := os.CreateTemp(dir,
-		fmt.Sprintf("%x.", sha256.Sum256([]byte(obj))))
+	f, err := os.CreateTemp(dir, p.tmpFilePrefix(obj))
 	if err != nil {
 		if errors.Is(err, syscall.EROFS) {
 			return nil, s3err.GetAPIError(s3err.ErrMethodNotAllowed)

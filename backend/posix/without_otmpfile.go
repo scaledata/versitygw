@@ -17,7 +17,6 @@
 package posix
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -58,8 +57,7 @@ func (p *Posix) openTmpFile(dir, bucket, obj string, size int64, acct auth.Accou
 		}
 		return nil, fmt.Errorf("make temp dir: %w", err)
 	}
-	f, err := os.CreateTemp(dir,
-		fmt.Sprintf("%x.", sha256.Sum256([]byte(obj))))
+	f, err := os.CreateTemp(dir, p.tmpFilePrefix(obj))
 	if err != nil {
 		if errors.Is(err, syscall.EROFS) {
 			return nil, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
@@ -109,7 +107,9 @@ func (tmp *tmpfile) link() error {
 	backoffMs := initialBackoffMs
 	for {
 		err = backend.MoveFile(tempname, objPath, defaultFilePerm)
-		if !os.IsNotExist(err) {
+		// errors.Is(ENOENT) covers Linux (incl. the EXDEV-fallback %w chain);
+		// os.IsNotExist also covers Windows, whose not-exist error is not ENOENT.
+		if !errors.Is(err, syscall.ENOENT) && !os.IsNotExist(err) {
 			break
 		}
 		// The parent directory may have been concurrently removed; backoff and retry.
@@ -117,12 +117,11 @@ func (tmp *tmpfile) link() error {
 		sleepWithJitter(backoffMs)
 		backoffMs = min((backoffMs * 2), maxBackoffMs)
 
-		// Best-effort: recreate the parent directory. Ignore errors here;
-		// if recreation fails transiently (e.g. Windows pending-delete on
-		// a recently removed directory), the next MoveFile attempt will
-		// return os.IsNotExist again and we will retry.
-		_ = backend.MkdirAll(filepath.Dir(objPath), tmp.uid, tmp.gid,
+		err = backend.MkdirAll(filepath.Dir(objPath), tmp.uid, tmp.gid,
 			tmp.doChown, tmp.newDirPerm)
+		if err != nil {
+			return fmt.Errorf("recreate parent dir: %w", err)
+		}
 	}
 	return err
 }
