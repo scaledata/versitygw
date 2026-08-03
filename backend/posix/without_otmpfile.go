@@ -75,8 +75,10 @@ func (p *Posix) openTmpFile(dir, bucket, obj string, size int64, acct auth.Accou
 	}
 
 	return &tmpfile{
-		f:          f,
-		bucket:     bucket,
+		f: f,
+		// Root the bucket so the reveal (link/rename) targets rootdir/bucket/obj,
+		// not a CWD-relative path — New no longer os.Chdir's into rootdir.
+		bucket:     p.rooted(bucket),
 		objname:    obj,
 		size:       size,
 		newDirPerm: p.newDirPerm,

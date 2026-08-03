@@ -246,23 +246,22 @@ type PosixOpts struct {
 }
 
 func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, error) {
-	if opts.SideCarDir != "" && strings.HasPrefix(opts.SideCarDir, rootdir) {
-		return nil, fmt.Errorf("sidecar directory cannot be inside the gateway root directory")
-	}
-
-	err := os.Chdir(rootdir)
-	if err != nil {
-		return nil, fmt.Errorf("chdir %v: %w", rootdir, err)
-	}
-
-	f, err := os.Open(rootdir)
-	if err != nil {
-		return nil, fmt.Errorf("open %v: %w", rootdir, err)
-	}
-
 	rootdirAbs, err := filepath.Abs(rootdir)
 	if err != nil {
 		return nil, fmt.Errorf("get absolute path of %v: %w", rootdir, err)
+	}
+
+	// NOTE: the "sidecar must not be inside the gateway root" check is enforced
+	// below by validateSubDir(rootdirAbs, opts.SideCarDir), which absolutizes the
+	// sidecar path and uses the segment-aware isDirBelowRoot. An earlier raw
+	// strings.HasPrefix(opts.SideCarDir, rootdirAbs) guard here was removed: it
+	// compared a possibly-relative SideCarDir against an absolute root (so it
+	// rarely fired) and was not path-boundary aware (it would flag
+	// "/data/rootBackup" as inside "/data/root").
+
+	f, err := os.Open(rootdirAbs)
+	if err != nil {
+		return nil, fmt.Errorf("open %v: %w", rootdirAbs, err)
 	}
 
 	var versioningdirAbs string
@@ -294,7 +293,7 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 	return &Posix{
 		meta:                 meta,
 		rootfd:               f,
-		rootdir:              rootdir,
+		rootdir:              rootdirAbs,
 		euid:                 os.Geteuid(),
 		egid:                 os.Getegid(),
 		chownuid:             opts.ChownUID,
@@ -311,6 +310,35 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		actionLimiter:        semaphore.NewWeighted(int64(concurrencyOrDefault(opts.Concurrency))),
 		copyObjectThreshold:  opts.CopyObjectThreshold,
 	}, nil
+}
+
+// rooted joins p.rootdir with the given path elements, producing an absolute path.
+// Used throughout in place of CWD-relative os.* calls, since New no longer calls
+// os.Chdir(rootdir) — each Posix instance is self-contained and safe to construct
+// more than once (e.g. at a different root) within the same process.
+//
+// If elems[0] is already absolute, it is joined as-is without prepending
+// p.rootdir. Several callers reassign a "bucket" variable to an
+// already-absolute path (e.g. filepath.Join(p.versioningDir, bucket), since
+// p.versioningDir is itself validated absolute) before passing it here, so
+// rooted must be safe to call unconditionally at the final path-construction
+// site rather than requiring every caller to track whether its bucket value
+// is still a bare name or already a full path.
+func (p *Posix) rooted(elems ...string) string {
+	if len(elems) > 0 && filepath.IsAbs(elems[0]) {
+		return filepath.Join(elems...)
+	}
+	return filepath.Join(append([]string{p.rootdir}, elems...)...)
+}
+
+// rootedTrailer is rooted's counterpart for callers that need joinPathWithTrailer's
+// trailing-slash preservation (directory-object paths). Same already-absolute
+// defense as rooted: elems[0] may already be an absolute versioningDir-based path.
+func (p *Posix) rootedTrailer(elems ...string) string {
+	if len(elems) > 0 && filepath.IsAbs(elems[0]) {
+		return joinPathWithTrailer(elems...)
+	}
+	return joinPathWithTrailer(append([]string{p.rootdir}, elems...)...)
 }
 
 // defaultMpuMemBufferMax caps in-memory buffering of a pre-stride Af2MPUHandler
@@ -337,7 +365,7 @@ func concurrencyOrDefault(n int) int {
 // atomic write of obj, for callers whose legacy staging dir is the per-bucket
 // .sgwtmp directory (e.g. PutObject). See tmpDirFor for the general form.
 func (p *Posix) tmpDir(bucket, obj string) string {
-	return p.tmpDirFor(filepath.Join(bucket, MetaTmpDir), bucket, obj)
+	return p.tmpDirFor(p.rooted(bucket, MetaTmpDir), bucket, obj)
 }
 
 // tmpDirFor returns the directory in which to create the atomic-write temp
@@ -350,7 +378,7 @@ func (p *Posix) tmpDir(bucket, obj string) string {
 // is why the legacy dir is an explicit argument rather than always .sgwtmp.
 func (p *Posix) tmpDirFor(legacyDir, bucket, finalObj string) string {
 	if p.sameDirTmp {
-		return filepath.Dir(filepath.Join(bucket, finalObj))
+		return filepath.Dir(p.rooted(bucket, finalObj))
 	}
 	return legacyDir
 }
@@ -472,7 +500,7 @@ func (p *Posix) validateVersionId(versionId string) error {
 }
 
 func (p *Posix) doesBucketAndObjectExist(bucket, object string) error {
-	_, err := os.Stat(bucket)
+	_, err := os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -480,7 +508,7 @@ func (p *Posix) doesBucketAndObjectExist(bucket, object string) error {
 		return fmt.Errorf("stat bucket: %w", err)
 	}
 
-	_, err = os.Stat(filepath.Join(bucket, object))
+	_, err = os.Stat(p.rooted(bucket, object))
 	if errors.Is(err, fs.ErrNotExist) || isErrNotDir(err) {
 		return s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -498,7 +526,7 @@ func (p *Posix) ListBuckets(ctx context.Context, input s3response.ListBucketsInp
 	}
 	defer release()
 
-	fis, err := listBucketFileInfos(p.bucketlinks)
+	fis, err := listBucketFileInfos(p.rootdir, p.bucketlinks)
 	if err != nil {
 		return s3response.ListAllMyBucketsResult{}, fmt.Errorf("listBucketFileInfos : %w", err)
 	}
@@ -584,7 +612,7 @@ func (p *Posix) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s3.
 	if !p.isBucketValid(*input.Bucket) {
 		return nil, s3err.GetBucketErr(s3err.ErrInvalidBucketName, *input.Bucket)
 	}
-	_, err = os.Lstat(*input.Bucket)
+	_, err = os.Lstat(p.rooted(*input.Bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, *input.Bucket)
 	}
@@ -620,7 +648,7 @@ func (p *Posix) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, a
 		return err
 	}
 
-	err = os.Mkdir(bucket, p.newDirPerm)
+	err = os.Mkdir(p.rooted(bucket), p.newDirPerm)
 	if err != nil && os.IsExist(err) {
 		aclJSON, err := p.meta.RetrieveAttribute(nil, bucket, "", aclkey)
 		if err != nil {
@@ -645,7 +673,7 @@ func (p *Posix) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, a
 	}
 
 	if doChown {
-		err := os.Chown(bucket, uid, gid)
+		err := os.Chown(p.rooted(bucket), uid, gid)
 		if err != nil {
 			return fmt.Errorf("chown bucket: %w", err)
 		}
@@ -774,7 +802,7 @@ func (p *Posix) isBucketEmpty(bucket string) error {
 		}
 	}
 
-	has, err := p.bucketDirHasContent(bucket, "")
+	has, err := p.bucketDirHasContent(p.rooted(bucket), "")
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -805,7 +833,7 @@ func (p *Posix) DeleteBucket(ctx context.Context, bucket string) error {
 	}
 
 	// Remove the bucket
-	err = os.RemoveAll(bucket)
+	err = os.RemoveAll(p.rooted(bucket))
 	if err != nil {
 		return fmt.Errorf("remove bucket: %w", err)
 	}
@@ -837,7 +865,7 @@ func (p *Posix) PutBucketOwnershipControls(ctx context.Context, bucket string, o
 	if !p.isBucketValid(bucket) {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -863,7 +891,7 @@ func (p *Posix) GetBucketOwnershipControls(ctx context.Context, bucket string) (
 	if !p.isBucketValid(bucket) {
 		return ownship, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return ownship, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -891,7 +919,7 @@ func (p *Posix) DeleteBucketOwnershipControls(ctx context.Context, bucket string
 	if !p.isBucketValid(bucket) {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -924,7 +952,7 @@ func (p *Posix) PutBucketVersioning(ctx context.Context, bucket string, status t
 	if !p.versioningEnabled() {
 		return s3err.GetAPIError(s3err.ErrVersioningNotConfigured)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -980,7 +1008,7 @@ func (p *Posix) GetBucketVersioning(ctx context.Context, bucket string) (s3respo
 		return s3response.GetBucketVersioningOutput{}, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
 
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.GetBucketVersioningOutput{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -1076,7 +1104,7 @@ func isRemovableAttr(attr string) bool {
 
 // Creates a new copy(version) of an object in the versioning directory
 func (p *Posix) createObjVersion(bucket, key string, size int64, acc auth.Account, removeAttributes bool) (versionPath string, err error) {
-	sf, err := os.Open(filepath.Join(bucket, key))
+	sf, err := os.Open(p.rooted(bucket, key))
 	if err != nil {
 		return "", err
 	}
@@ -1179,7 +1207,7 @@ func (p *Posix) ListObjectVersions(ctx context.Context, input *s3.ListObjectVers
 		max = int(*input.MaxKeys)
 	}
 
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.ListVersionsResult{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -1187,7 +1215,7 @@ func (p *Posix) ListObjectVersions(ctx context.Context, input *s3.ListObjectVers
 		return s3response.ListVersionsResult{}, fmt.Errorf("stat bucket: %w", err)
 	}
 
-	fileSystem := os.DirFS(bucket)
+	fileSystem := os.DirFS(p.rooted(bucket))
 	results, err := backend.WalkVersions(ctx, fileSystem, prefix, delim, keyMarker, versionIdMarker, max,
 		p.fileToObjVersions(bucket), []string{MetaTmpDir})
 	if err != nil {
@@ -1226,7 +1254,7 @@ func (p *Posix) ensureNotDeleteMarker(bucket, object, versionId string) error {
 	// data file simply doesn't exist — the two cases are indistinguishable
 	// from metadata alone.  Verify the data file directly so callers
 	// receive the correct NoSuchVersion / NoSuchKey error.
-	if _, statErr := os.Stat(filepath.Join(bucket, object)); errors.Is(statErr, fs.ErrNotExist) || isErrNotDir(statErr) {
+	if _, statErr := os.Stat(p.rooted(bucket, object)); errors.Is(statErr, fs.ErrNotExist) || isErrNotDir(statErr) {
 		if versionId != "" {
 			return s3err.GetAPIError(s3err.ErrNoSuchVersion)
 		}
@@ -1655,7 +1683,7 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
 
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -1682,7 +1710,7 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 	// multiple uploads for same object name allowed,
 	// they will all go into the same hashed name directory
 	objdir := filepath.Join(MetaTmpMultipartDir, fmt.Sprintf("%x", objNameSum))
-	tmppath := filepath.Join(bucket, objdir)
+	tmppath := p.rooted(bucket, objdir)
 	// the unique upload id is a directory for all of the parts
 	// associated with this specific multipart upload
 	err = os.MkdirAll(filepath.Join(tmppath, uploadID), 0755)
@@ -1956,7 +1984,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		return res, "", s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
 
-	_, err := os.Stat(bucket)
+	_, err := os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return res, "", s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -1969,7 +1997,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 	// the same ETag, so it will either find the directory still present (still
 	// processing) or gone (already completed) and react accordingly.
 	sum := sha256.Sum256([]byte(object))
-	objdirFull := filepath.Join(bucket, MetaTmpMultipartDir, fmt.Sprintf("%x", sum))
+	objdirFull := p.rooted(bucket, MetaTmpMultipartDir, fmt.Sprintf("%x", sum))
 	uploadIDDir := filepath.Join(objdirFull, uploadID)
 	// Calculate s3 compatible md5sum for complete multipart.
 	s3MD5, err := backend.GetMultipartMD5(parts)
@@ -1991,7 +2019,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 			}, "", nil
 		}
 		// Directory is gone: the concurrent call already completed and cleaned up.
-		if _, statErr := os.Stat(filepath.Join(bucket, object)); statErr == nil {
+		if _, statErr := os.Stat(p.rooted(bucket, object)); statErr == nil {
 			return s3response.CompleteMultipartUploadResult{
 				Bucket: &bucket,
 				ETag:   &s3MD5,
@@ -2111,7 +2139,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		partNumber = *part.PartNumber
 
 		partObjPath := filepath.Join(objdir, activeUploadName, fmt.Sprintf("%v", *part.PartNumber))
-		fullPartPath := filepath.Join(bucket, partObjPath)
+		fullPartPath := p.rooted(bucket, partObjPath)
 		fi, err := os.Lstat(fullPartPath)
 		if err != nil {
 			return res, "", s3err.GetInvalidPartErr(uploadID, *part.PartNumber, backend.GetStringFromPtr(part.ETag))
@@ -2255,7 +2283,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		}
 	}
 
-	f, err := p.openTmpFile(p.tmpDirFor(filepath.Join(bucket, MetaTmpDir), bucket, object), bucket, object,
+	f, err := p.openTmpFile(p.tmpDirFor(p.rooted(bucket, MetaTmpDir), bucket, object), bucket, object,
 		totalsize, acct, skipFalloc, p.forceNoTmpFile)
 	if err != nil {
 		if errors.Is(err, syscall.EDQUOT) {
@@ -2271,7 +2299,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 	var abortOnErrSet bool
 	for _, part := range parts {
 		partObjPath := filepath.Join(objdir, activeUploadName, fmt.Sprintf("%v", *part.PartNumber))
-		fullPartPath := filepath.Join(bucket, partObjPath)
+		fullPartPath := p.rooted(bucket, partObjPath)
 		pf, err := os.Open(fullPartPath)
 		if err != nil {
 			return res, "", fmt.Errorf("open part %v: %v", *part.PartNumber, err)
@@ -2298,11 +2326,11 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 				if !abortOnErrSet {
 					defer func() {
 						// cleanup tmp dirs
-						os.RemoveAll(filepath.Join(bucket, objdir, activeUploadName))
+						os.RemoveAll(p.rooted(bucket, objdir, activeUploadName))
 						// use Remove for objdir in case there are still other
 						// uploads for same object name outstanding, this will
 						// fail if there are any
-						os.Remove(filepath.Join(bucket, objdir))
+						os.Remove(p.rooted(bucket, objdir))
 					}()
 				}
 				abortOnErrSet = true
@@ -2334,7 +2362,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		return res, "", err
 	}
 
-	objname := filepath.Join(bucket, object)
+	objname := p.rooted(bucket, object)
 	dir := filepath.Dir(objname)
 	if dir != "" {
 		uid, gid, doChown := p.getChownIDs(acct)
@@ -2440,10 +2468,10 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 	}
 
 	// cleanup tmp dirs
-	os.RemoveAll(filepath.Join(bucket, objdir, activeUploadName))
+	os.RemoveAll(p.rooted(bucket, objdir, activeUploadName))
 	// use Remove for objdir in case there are still other uploads
 	// for same object name outstanding, this will fail if there are any
-	os.Remove(filepath.Join(bucket, objdir))
+	os.Remove(p.rooted(bucket, objdir))
 
 	return s3response.CompleteMultipartUploadResult{
 		Bucket:            &bucket,
@@ -2565,7 +2593,7 @@ func numberOfChecksums(part types.CompletedPart) (int, string) {
 
 func (p *Posix) checkUploadIDExists(bucket, object, uploadID string) ([32]byte, error) {
 	sum := sha256.Sum256([]byte(object))
-	objdir := filepath.Join(bucket, MetaTmpMultipartDir, fmt.Sprintf("%x", sum))
+	objdir := p.rooted(bucket, MetaTmpMultipartDir, fmt.Sprintf("%x", sum))
 
 	_, err := os.Stat(filepath.Join(objdir, uploadID))
 	if errors.Is(err, fs.ErrNotExist) {
@@ -2815,7 +2843,7 @@ func (p *Posix) abortMultipartInternal(_ context.Context, mpu *s3.AbortMultipart
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
 
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -2824,7 +2852,7 @@ func (p *Posix) abortMultipartInternal(_ context.Context, mpu *s3.AbortMultipart
 	}
 
 	sum := sha256.Sum256([]byte(object))
-	objdir := filepath.Join(bucket, MetaTmpMultipartDir, fmt.Sprintf("%x", sum))
+	objdir := p.rooted(bucket, MetaTmpMultipartDir, fmt.Sprintf("%x", sum))
 
 	f, err := os.Stat(filepath.Join(objdir, uploadID))
 	if err != nil {
@@ -2884,7 +2912,7 @@ func (p *Posix) ListMultipartUploads(ctx context.Context, mpu *s3.ListMultipartU
 	}
 	maxUploads := int(*mpu.MaxUploads)
 
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return lmu, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -2893,7 +2921,7 @@ func (p *Posix) ListMultipartUploads(ctx context.Context, mpu *s3.ListMultipartU
 	}
 
 	// ignore readdir error and use the empty list returned
-	objs, _ := os.ReadDir(filepath.Join(bucket, MetaTmpMultipartDir))
+	objs, _ := os.ReadDir(p.rooted(bucket, MetaTmpMultipartDir))
 
 	var uploads []s3response.Upload
 
@@ -2915,7 +2943,7 @@ func (p *Posix) ListMultipartUploads(ctx context.Context, mpu *s3.ListMultipartU
 			continue
 		}
 
-		upids, err := os.ReadDir(filepath.Join(bucket, MetaTmpMultipartDir, obj.Name()))
+		upids, err := os.ReadDir(p.rooted(bucket, MetaTmpMultipartDir, obj.Name()))
 		if err != nil {
 			continue
 		}
@@ -3024,7 +3052,7 @@ func (p *Posix) listPartsInternal(ctx context.Context, input *s3.ListPartsInput)
 		}
 	}
 
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return lpr, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -3038,7 +3066,7 @@ func (p *Posix) listPartsInternal(ctx context.Context, input *s3.ListPartsInput)
 	}
 
 	objdir := filepath.Join(MetaTmpMultipartDir, fmt.Sprintf("%x", sum))
-	tmpdir := filepath.Join(bucket, objdir)
+	tmpdir := p.rooted(bucket, objdir)
 
 	ents, err := os.ReadDir(filepath.Join(tmpdir, uploadID))
 	if errors.Is(err, fs.ErrNotExist) {
@@ -3089,7 +3117,7 @@ func (p *Posix) listPartsInternal(ctx context.Context, input *s3.ListPartsInput)
 			continue
 		}
 
-		fi, err := os.Lstat(filepath.Join(bucket, partPath))
+		fi, err := os.Lstat(p.rooted(bucket, partPath))
 		if err != nil {
 			continue
 		}
@@ -3180,7 +3208,7 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 	}
 	r := input.Body
 
-	_, err := os.Stat(bucket)
+	_, err := os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -3192,7 +3220,7 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 	objdir := filepath.Join(MetaTmpMultipartDir, fmt.Sprintf("%x", sum))
 	mpPath := filepath.Join(objdir, uploadID)
 
-	_, err = os.Stat(filepath.Join(bucket, mpPath))
+	_, err = os.Stat(p.rooted(bucket, mpPath))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetNoSuchUploadErr(uploadID)
 	}
@@ -3202,7 +3230,7 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 
 	partPath := filepath.Join(mpPath, fmt.Sprintf("%v", *part))
 
-	f, err := p.openTmpFile(p.tmpDirFor(filepath.Join(bucket, objdir), bucket, partPath),
+	f, err := p.openTmpFile(p.tmpDirFor(p.rooted(bucket, objdir), bucket, partPath),
 		bucket, partPath, length, acct, doFalloc, p.forceNoTmpFile)
 	if err != nil {
 		if errors.Is(err, syscall.EDQUOT) {
@@ -3460,7 +3488,7 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		return s3response.CopyPartResult{}, s3err.GetBucketErr(s3err.ErrInvalidBucketName, *upi.Bucket)
 	}
 
-	_, err = os.Stat(*upi.Bucket)
+	_, err = os.Stat(p.rooted(*upi.Bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.CopyPartResult{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, *upi.Bucket)
 	}
@@ -3471,7 +3499,7 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 	sum := sha256.Sum256([]byte(*upi.Key))
 	objdir := filepath.Join(MetaTmpMultipartDir, fmt.Sprintf("%x", sum))
 
-	_, err = os.Stat(filepath.Join(*upi.Bucket, objdir, *upi.UploadId))
+	_, err = os.Stat(p.rooted(*upi.Bucket, objdir, *upi.UploadId))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.CopyPartResult{}, s3err.GetNoSuchUploadErr(*upi.UploadId)
 	}
@@ -3492,7 +3520,7 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		return s3response.CopyPartResult{}, err
 	}
 
-	_, err = os.Stat(srcBucket)
+	_, err = os.Stat(p.rooted(srcBucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.CopyPartResult{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, srcBucket)
 	}
@@ -3538,7 +3566,7 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		}
 	}
 
-	objPath := filepath.Join(srcBucket, srcObject)
+	objPath := p.rooted(srcBucket, srcObject)
 	fi, err := os.Stat(objPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		if p.versioningEnabled() && vEnabled {
@@ -3587,7 +3615,7 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		return s3response.CopyPartResult{}, err
 	}
 
-	f, err := p.openTmpFile(p.tmpDirFor(filepath.Join(*upi.Bucket, objdir), *upi.Bucket, partPath),
+	f, err := p.openTmpFile(p.tmpDirFor(p.rooted(*upi.Bucket, objdir), *upi.Bucket, partPath),
 		*upi.Bucket, partPath, length, acct, doFalloc, p.forceNoTmpFile)
 	if err != nil {
 		if errors.Is(err, syscall.EDQUOT) {
@@ -3695,7 +3723,7 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		return s3response.CopyPartResult{}, fmt.Errorf("link object in namespace: %w", err)
 	}
 
-	fi, err = os.Stat(filepath.Join(*upi.Bucket, partPath))
+	fi, err = os.Stat(p.rooted(*upi.Bucket, partPath))
 	if err != nil {
 		return s3response.CopyPartResult{}, fmt.Errorf("stat part path: %w", err)
 	}
@@ -3767,7 +3795,7 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 	if !p.isBucketValid(*po.Bucket) {
 		return s3response.PutObjectOutput{}, s3err.GetBucketErr(s3err.ErrInvalidBucketName, *po.Bucket)
 	}
-	_, err := os.Stat(*po.Bucket)
+	_, err := os.Stat(p.rooted(*po.Bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.PutObjectOutput{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, *po.Bucket)
 	}
@@ -3780,7 +3808,7 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 		return s3response.PutObjectOutput{}, err
 	}
 
-	name := filepath.Join(*po.Bucket, *po.Key)
+	name := p.rooted(*po.Bucket, *po.Key)
 
 	// evaluate preconditions
 	etagBytes, err := p.meta.RetrieveAttribute(nil, *po.Bucket, *po.Key, etagkey)
@@ -4213,7 +4241,7 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 		return nil, err
 	}
 
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -4221,7 +4249,7 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 		return nil, fmt.Errorf("stat bucket: %w", err)
 	}
 
-	objpath := filepath.Join(bucket, object)
+	objpath := p.rooted(bucket, object)
 
 	vStatus, err := p.getBucketVersioningStatus(ctx, bucket)
 	if err != nil {
@@ -4231,7 +4259,7 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 	evalPreconditions := func(f os.FileInfo, bucket, object string) error {
 		var err error
 		if f == nil {
-			f, err = os.Stat(filepath.Join(bucket, object))
+			f, err = os.Stat(p.rooted(bucket, object))
 			if err != nil {
 				return nil
 			}
@@ -4340,7 +4368,7 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 				// Also handle ENOTDIR: when a key such as "foo/bar" is requested
 				// but "foo" is a regular file (not a directory), the path cannot
 				// contain any object.
-				_, statErr := os.Stat(filepath.Join(bucket, object))
+				_, statErr := os.Stat(p.rooted(bucket, object))
 				if errors.Is(statErr, fs.ErrNotExist) || isErrNotDir(statErr) {
 					return &s3.DeleteObjectOutput{VersionId: input.VersionId}, nil
 				}
@@ -4399,7 +4427,7 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 					acct = auth.Account{}
 				}
 
-				f, err := p.openTmpFile(p.tmpDirFor(filepath.Join(bucket, MetaTmpDir), bucket, object),
+				f, err := p.openTmpFile(p.tmpDirFor(p.rooted(bucket, MetaTmpDir), bucket, object),
 					bucket, object, srcObjVersion.Size(), acct, doFalloc,
 					p.forceNoTmpFile)
 				if err != nil {
@@ -4580,7 +4608,7 @@ func (p *Posix) removeParents(bucket, object string) {
 			break
 		}
 
-		err = os.Remove(filepath.Join(bucket, parent))
+		err = os.Remove(p.rooted(bucket, parent))
 		if err != nil {
 			break
 		}
@@ -4672,7 +4700,7 @@ func (p *Posix) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.Ge
 	if !p.isBucketValid(bucket) {
 		return nil, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -4699,7 +4727,7 @@ func (p *Posix) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.Ge
 		}
 	}
 
-	objPath := filepath.Join(bucket, object)
+	objPath := p.rooted(bucket, object)
 
 	fid, err := os.Stat(objPath)
 	if errors.Is(err, fs.ErrNotExist) || isErrNotDir(err) {
@@ -5016,7 +5044,7 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 		return nil, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
 
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -5043,7 +5071,7 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 		}
 	}
 
-	objPath := filepath.Join(bucket, object)
+	objPath := p.rooted(bucket, object)
 
 	fi, err := os.Stat(objPath)
 	if errors.Is(err, fs.ErrNotExist) || isErrNotDir(err) {
@@ -5337,7 +5365,7 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 		return s3response.CopyObjectOutput{}, s3err.GetBucketErr(s3err.ErrInvalidBucketName, dstBucket)
 	}
 
-	_, err = os.Stat(srcBucket)
+	_, err = os.Stat(p.rooted(srcBucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.CopyObjectOutput{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, srcBucket)
 	}
@@ -5384,7 +5412,7 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 		}
 	}
 
-	_, err = os.Stat(dstBucket)
+	_, err = os.Stat(p.rooted(dstBucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.CopyObjectOutput{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, dstBucket)
 	}
@@ -5392,7 +5420,7 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 		return s3response.CopyObjectOutput{}, fmt.Errorf("stat bucket: %w", err)
 	}
 
-	objPath := joinPathWithTrailer(srcBucket, srcObject)
+	objPath := p.rootedTrailer(srcBucket, srcObject)
 	f, err := os.Open(objPath)
 	if errors.Is(err, fs.ErrNotExist) || isErrNotDir(err) {
 		if p.versioningEnabled() && vEnabled {
@@ -5452,7 +5480,7 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 	var xxhash128 *string
 	var chType types.ChecksumType
 
-	dstObjdPath := joinPathWithTrailer(dstBucket, dstObject)
+	dstObjdPath := p.rootedTrailer(dstBucket, dstObject)
 	if dstObjdPath == objPath {
 		if input.MetadataDirective == types.MetadataDirectiveCopy {
 			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidCopyDest)
@@ -5725,7 +5753,7 @@ func (p *Posix) ListObjectsParametrized(ctx context.Context, input *s3.ListObjec
 		return s3response.ListObjectsResult{}, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
 
-	_, err := os.Stat(bucket)
+	_, err := os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.ListObjectsResult{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -5733,7 +5761,7 @@ func (p *Posix) ListObjectsParametrized(ctx context.Context, input *s3.ListObjec
 		return s3response.ListObjectsResult{}, fmt.Errorf("stat bucket: %w", err)
 	}
 
-	fileSystem := os.DirFS(bucket)
+	fileSystem := os.DirFS(p.rooted(bucket))
 	results, err := backend.Walk(ctx, fileSystem, prefix, delim, marker, maxkeys,
 		customFileToObj(bucket, true), []string{MetaTmpDir})
 	if err != nil {
@@ -5902,7 +5930,7 @@ func (p *Posix) ListObjectsV2Parametrized(ctx context.Context, input *s3.ListObj
 		return s3response.ListObjectsV2Result{}, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
 
-	_, err := os.Stat(bucket)
+	_, err := os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.ListObjectsV2Result{}, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -5910,7 +5938,7 @@ func (p *Posix) ListObjectsV2Parametrized(ctx context.Context, input *s3.ListObj
 		return s3response.ListObjectsV2Result{}, fmt.Errorf("stat bucket: %w", err)
 	}
 
-	fileSystem := os.DirFS(bucket)
+	fileSystem := os.DirFS(p.rooted(bucket))
 	results, err := backend.Walk(ctx, fileSystem, prefix, delim, marker, maxkeys,
 		customFileToObj(bucket, fetchOwner), []string{MetaTmpDir})
 	if err != nil {
@@ -5949,7 +5977,7 @@ func (p *Posix) PutBucketAcl(ctx context.Context, bucket string, data []byte) er
 	if !p.isBucketValid(bucket) {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -5975,7 +6003,7 @@ func (p *Posix) GetBucketAcl(ctx context.Context, input *s3.GetBucketAclInput) (
 	if !p.isBucketValid(*input.Bucket) {
 		return nil, s3err.GetBucketErr(s3err.ErrInvalidBucketName, *input.Bucket)
 	}
-	_, err = os.Stat(*input.Bucket)
+	_, err = os.Stat(p.rooted(*input.Bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, *input.Bucket)
 	}
@@ -6003,7 +6031,7 @@ func (p *Posix) PutBucketTagging(ctx context.Context, bucket string, tags map[st
 	if !p.isBucketValid(bucket) {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -6043,7 +6071,7 @@ func (p *Posix) GetBucketTagging(ctx context.Context, bucket string) (map[string
 	if !p.isBucketValid(bucket) {
 		return nil, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -6076,7 +6104,7 @@ func (p *Posix) GetObjectTagging(ctx context.Context, bucket, object, versionId 
 	if !p.isBucketValid(bucket) {
 		return nil, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -6089,7 +6117,7 @@ func (p *Posix) GetObjectTagging(ctx context.Context, bucket, object, versionId 
 	}
 
 	if versionId == "" {
-		_, err = os.Stat(filepath.Join(bucket, object))
+		_, err = os.Stat(p.rooted(bucket, object))
 		if errors.Is(err, fs.ErrNotExist) || isErrNotDir(err) {
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 		}
@@ -6166,7 +6194,7 @@ func (p *Posix) PutObjectTagging(ctx context.Context, bucket, object, versionId 
 	if !p.isBucketValid(bucket) {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -6179,7 +6207,7 @@ func (p *Posix) PutObjectTagging(ctx context.Context, bucket, object, versionId 
 	}
 
 	if versionId == "" {
-		_, err = os.Stat(filepath.Join(bucket, object))
+		_, err = os.Stat(p.rooted(bucket, object))
 		if errors.Is(err, fs.ErrNotExist) || isErrNotDir(err) {
 			return s3err.GetAPIError(s3err.ErrNoSuchKey)
 		}
@@ -6268,7 +6296,7 @@ func (p *Posix) PutBucketPolicy(ctx context.Context, bucket string, policy []byt
 	if !p.isBucketValid(bucket) {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -6307,7 +6335,7 @@ func (p *Posix) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, err
 	if !p.isBucketValid(bucket) {
 		return nil, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -6346,7 +6374,7 @@ func (p *Posix) PutBucketCors(ctx context.Context, bucket string, cors []byte) e
 	if !p.isBucketValid(bucket) {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -6381,7 +6409,7 @@ func (p *Posix) GetBucketCors(ctx context.Context, bucket string) ([]byte, error
 	if !p.isBucketValid(bucket) {
 		return nil, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -6417,7 +6445,7 @@ func (p *Posix) PutBucketWebsite(ctx context.Context, bucket string, website []b
 	if !p.isBucketValid(bucket) {
 		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -6459,7 +6487,7 @@ func (p *Posix) GetBucketWebsite(ctx context.Context, bucket string) ([]byte, er
 	if !p.isBucketValid(bucket) {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -6524,7 +6552,7 @@ func (p *Posix) PutObjectLockConfiguration(ctx context.Context, bucket string, c
 	if !p.isBucketValid(bucket) {
 		return s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -6567,7 +6595,7 @@ func (p *Posix) GetObjectLockConfiguration(ctx context.Context, bucket string) (
 	if !p.isBucketValid(bucket) {
 		return nil, s3err.GetBucketErr(s3err.ErrInvalidBucketName, bucket)
 	}
-	_, err = os.Stat(bucket)
+	_, err = os.Stat(p.rooted(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetBucketErr(s3err.ErrNoSuchBucket, bucket)
 	}
@@ -6852,8 +6880,8 @@ func (p *Posix) ChangeBucketOwner(ctx context.Context, bucket, owner string) err
 	return auth.UpdateBucketACLOwner(ctx, p, bucket, owner)
 }
 
-func listBucketFileInfos(bucketlinks bool) ([]fs.FileInfo, error) {
-	entries, err := os.ReadDir(".")
+func listBucketFileInfos(rootdir string, bucketlinks bool) ([]fs.FileInfo, error) {
+	entries, err := os.ReadDir(rootdir)
 	if err != nil {
 		return nil, fmt.Errorf("readdir buckets: %w", err)
 	}
@@ -6866,7 +6894,7 @@ func listBucketFileInfos(bucketlinks bool) ([]fs.FileInfo, error) {
 		}
 
 		if bucketlinks && entry.Type() == fs.ModeSymlink {
-			fi, err = os.Stat(entry.Name())
+			fi, err = os.Stat(filepath.Join(rootdir, entry.Name()))
 			if err != nil {
 				// skip entries returning errors
 				continue
@@ -6891,7 +6919,7 @@ func (p *Posix) ListBucketsAndOwners(ctx context.Context) (buckets []s3response.
 	}
 	defer release()
 
-	fis, err := listBucketFileInfos(p.bucketlinks)
+	fis, err := listBucketFileInfos(p.rootdir, p.bucketlinks)
 	if err != nil {
 		return buckets, fmt.Errorf("listBucketFileInfos: %w", err)
 	}
@@ -6921,8 +6949,8 @@ func (p *Posix) ListBucketsAndOwners(ctx context.Context) (buckets []s3response.
 }
 
 func (p *Posix) NormalizeObjectKey(bucket, object string) string {
-	fullPath := filepath.Join(bucket, object)
-	key, err := filepath.Rel(filepath.Clean(bucket), fullPath)
+	fullPath := p.rooted(bucket, object)
+	key, err := filepath.Rel(p.rooted(bucket), fullPath)
 	if err != nil {
 		return fullPath
 	}

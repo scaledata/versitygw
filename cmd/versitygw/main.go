@@ -159,8 +159,11 @@ documentation can be found in the GitHub wiki.`,
 			webuiPathPrefix = ctx.String("webui-path-prefix")
 			websitePorts = ctx.StringSlice("website")
 
-			// Resolve relative UNIX socket paths to absolute before any backend
-			// (e.g. posix) can change the working directory via os.Chdir.
+			// Resolve relative UNIX socket paths to absolute up front, while the
+			// process working directory is still the one the operator launched
+			// from. (Historically the posix backend changed the CWD via os.Chdir;
+			// that is gone now — paths are rooted explicitly — but resolving
+			// sockets early remains the clearest, order-independent behavior.)
 			var err error
 			if ports, err = utils.AbsSocketPaths(ports); err != nil {
 				return err
