@@ -107,13 +107,16 @@ func unwrapLocalOnly(tok string) (cursor string, ok bool) {
 	return string(raw), true
 }
 
-// backendFor returns the backend for slot i: the local backend for this node's
-// own slot, the forwarding peer otherwise.
-func (r *Router) backendFor(i int) backend.Backend {
-	if i == r.selfIdx {
-		return r.local
+// backendFor returns the backend for slot i within the given cfg snapshot: the
+// local backend for this node's own slot, the forwarding peer otherwise. The
+// snapshot is passed in (rather than reloaded) so a whole fanned-out LIST reads
+// one consistent (n, selfIdx, peers) even if Reconfigure installs a new cfg
+// mid-request.
+func backendFor(c *routerCfg, i int) backend.Backend {
+	if i == c.selfIdx {
+		return c.local
 	}
-	return r.peers[i]
+	return c.peers[i]
 }
 
 // ListObjectsV2 fans the request out to every channel, k-way merges the
@@ -140,6 +143,7 @@ func (r *Router) backendFor(i int) backend.Backend {
 // interleave vs. the maxKeys cut needs more care). The flat (no-delimiter)
 // listing used by cp/sync restore is fully correct.
 func (r *Router) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {
+	cfg := r.cfg.Load()
 	// Local-only fan-out sub-request from a peer router: serve just this node's
 	// channel and never re-fan (peers point at :9002 routers, so re-fanning would
 	// recurse across the cluster).
@@ -152,11 +156,11 @@ func (r *Router) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input) (
 				c := cursor
 				sub.ContinuationToken = &c
 			}
-			return r.local.ListObjectsV2(ctx, &sub)
+			return cfg.local.ListObjectsV2(ctx, &sub)
 		}
 	}
-	if r.n <= 1 {
-		return r.local.ListObjectsV2(ctx, in)
+	if cfg.n <= 1 {
+		return cfg.local.ListObjectsV2(ctx, in)
 	}
 
 	maxKeys, err := clampMaxKeys(in.MaxKeys)
@@ -166,9 +170,9 @@ func (r *Router) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input) (
 
 	// Seed per-backend cursors: from the compound token when resuming, else all
 	// backends start at the user's StartAfter (empty => bucket start).
-	cursors := make([]string, r.n)
+	cursors := make([]string, cfg.n)
 	if tok := backend.GetStringFromPtr(in.ContinuationToken); tok != "" {
-		cs, ok, derr := decodeCompound(tok, r.n)
+		cs, ok, derr := decodeCompound(tok, cfg.n)
 		if derr != nil {
 			return s3response.ListObjectsV2Result{}, derr
 		}
@@ -185,17 +189,17 @@ func (r *Router) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input) (
 		}
 	}
 
-	pages := make([]s3response.ListObjectsV2Result, r.n)
+	pages := make([]s3response.ListObjectsV2Result, cfg.n)
 	if maxKeys > 0 {
 		g, gctx := errgroup.WithContext(ctx)
-		for i := 0; i < r.n; i++ {
+		for i := 0; i < cfg.n; i++ {
 			i := i
-			be := r.backendFor(i)
+			be := backendFor(cfg, i)
 			g.Go(func() error {
 				sub := *in // shallow copy; only this goroutine's scalar ptr fields are replaced
 				sub.StartAfter = nil
 				sub.ContinuationToken = nil
-				if i == r.selfIdx {
+				if i == cfg.selfIdx {
 					// local slot: raw exclusive marker straight to the posix backend
 					if cursors[i] != "" {
 						c := cursors[i]
@@ -222,8 +226,8 @@ func (r *Router) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input) (
 		}
 	}
 
-	contents := make([][]s3response.Object, r.n)
-	pageTrunc := make([]bool, r.n)
+	contents := make([][]s3response.Object, cfg.n)
+	pageTrunc := make([]bool, cfg.n)
 	for i := range pages {
 		contents[i] = pages[i].Contents
 		pageTrunc[i] = boolVal(pages[i].IsTruncated)
@@ -272,6 +276,7 @@ func (r *Router) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input) (
 // v1 limitation. The restore path (cp/sync) uses ListObjectsV2, which has no
 // such ambiguity.
 func (r *Router) ListObjects(ctx context.Context, in *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
+	cfg := r.cfg.Load()
 	// Local-only fan-out sub-request (sentinel in Marker): serve this node's
 	// channel only, never re-fan. See ListObjectsV2.
 	if mkr := backend.GetStringFromPtr(in.Marker); mkr != "" {
@@ -282,11 +287,11 @@ func (r *Router) ListObjects(ctx context.Context, in *s3.ListObjectsInput) (s3re
 				c := cursor
 				sub.Marker = &c
 			}
-			return r.local.ListObjects(ctx, &sub)
+			return cfg.local.ListObjects(ctx, &sub)
 		}
 	}
-	if r.n <= 1 {
-		return r.local.ListObjects(ctx, in)
+	if cfg.n <= 1 {
+		return cfg.local.ListObjects(ctx, in)
 	}
 
 	maxKeys, err := clampMaxKeys(in.MaxKeys)
@@ -294,9 +299,9 @@ func (r *Router) ListObjects(ctx context.Context, in *s3.ListObjectsInput) (s3re
 		return s3response.ListObjectsResult{}, err
 	}
 
-	cursors := make([]string, r.n)
+	cursors := make([]string, cfg.n)
 	if mk := backend.GetStringFromPtr(in.Marker); mk != "" {
-		cs, ok, derr := decodeCompound(mk, r.n)
+		cs, ok, derr := decodeCompound(mk, cfg.n)
 		if derr != nil {
 			return s3response.ListObjectsResult{}, derr
 		}
@@ -309,16 +314,16 @@ func (r *Router) ListObjects(ctx context.Context, in *s3.ListObjectsInput) (s3re
 		}
 	}
 
-	pages := make([]s3response.ListObjectsResult, r.n)
+	pages := make([]s3response.ListObjectsResult, cfg.n)
 	if maxKeys > 0 {
 		g, gctx := errgroup.WithContext(ctx)
-		for i := 0; i < r.n; i++ {
+		for i := 0; i < cfg.n; i++ {
 			i := i
-			be := r.backendFor(i)
+			be := backendFor(cfg, i)
 			g.Go(func() error {
 				sub := *in
 				sub.Marker = nil
-				if i == r.selfIdx {
+				if i == cfg.selfIdx {
 					// local slot: raw exclusive marker straight to the posix backend
 					if cursors[i] != "" {
 						c := cursors[i]
@@ -345,8 +350,8 @@ func (r *Router) ListObjects(ctx context.Context, in *s3.ListObjectsInput) (s3re
 		}
 	}
 
-	contents := make([][]s3response.Object, r.n)
-	pageTrunc := make([]bool, r.n)
+	contents := make([][]s3response.Object, cfg.n)
+	pageTrunc := make([]bool, cfg.n)
 	for i := range pages {
 		contents[i] = pages[i].Contents
 		pageTrunc[i] = boolVal(pages[i].IsTruncated)
