@@ -87,6 +87,12 @@ type Posix struct {
 	// support copy_file_range is mounted over NFSv4.2.
 	forceNoCopyFileRange bool
 
+	// mpuHandler is the pluggable multipart upload write strategy.
+	// Defaults to StandardMPUHandler (staging-and-concat). An alternative
+	// implementation can be supplied at construction to change the multipart
+	// write path without touching the S3 verb handlers.
+	mpuHandler MPUHandler
+
 	// sameDirTmp creates the temp file used for atomic object writes in
 	// the SAME directory as the final object (instead of a per-bucket
 	// .sgwtmp staging subdir), so that the commit rename/link is always
@@ -260,6 +266,7 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		bucketlinks:          opts.BucketLinks,
 		versioningDir:        versioningdirAbs,
 		newDirPerm:           opts.NewDirPerm,
+		mpuHandler:           StandardMPUHandler{},
 		forceNoTmpFile:       opts.ForceNoTmpFile,
 		forceNoCopyFileRange: opts.ForceNoCopyFileRange,
 		sameDirTmp:           opts.SameDirTmp,
@@ -1852,7 +1859,7 @@ func (p *Posix) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteM
 	}
 	defer release()
 
-	return p.CompleteMultipartUploadWithCopy(ctx, input, nil)
+	return p.mpuHandler.CompleteMultipartUpload(ctx, p, input)
 }
 
 type onlyRead struct {
@@ -2732,6 +2739,11 @@ func (p *Posix) AbortMultipartUpload(ctx context.Context, mpu *s3.AbortMultipart
 	}
 	defer release()
 
+	return p.mpuHandler.AbortMultipartUpload(ctx, p, mpu)
+}
+
+func (p *Posix) abortMultipartInternal(_ context.Context, mpu *s3.AbortMultipartUploadInput) error {
+	var err error
 	if mpu.Key == nil {
 		return s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -2920,7 +2932,12 @@ func (p *Posix) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3resp
 	}
 	defer release()
 
+	return p.mpuHandler.ListParts(ctx, p, input)
+}
+
+func (p *Posix) listPartsInternal(ctx context.Context, input *s3.ListPartsInput) (s3response.ListPartsResult, error) {
 	var lpr s3response.ListPartsResult
+	var err error
 
 	if input.Key == nil {
 		return lpr, s3err.GetAPIError(s3err.ErrNoSuchKey)
@@ -3081,7 +3098,7 @@ func (p *Posix) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.
 	}
 	defer release()
 
-	return p.UploadPartWithPostFunc(ctx, input, func(*os.File) error { return nil })
+	return p.mpuHandler.UploadPart(ctx, p, input)
 }
 
 func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPartInput, postprocess func(f *os.File) error) (*s3.UploadPartOutput, error) {
