@@ -72,7 +72,11 @@ type ScoutFS struct {
 }
 
 func New(rootdir string, opts ScoutfsOpts) (*ScoutFS, error) {
-	metastore := meta.XattrMeta{}
+	rootdirAbs, err := filepath.Abs(rootdir)
+	if err != nil {
+		return nil, fmt.Errorf("get absolute path of %v: %w", rootdir, err)
+	}
+	metastore := meta.XattrMeta{Rootdir: rootdirAbs}
 
 	p, err := posix.New(rootdir, metastore, posix.PosixOpts{
 		ChownUID:            opts.ChownUID,

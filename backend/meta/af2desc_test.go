@@ -373,6 +373,52 @@ func TestAf2DescConcurrent(t *testing.T) {
 	}
 }
 
+// TestAf2DescRootdir verifies rooted() resolution and that a path-based
+// (nil-fd) store/retrieve with a RELATIVE bucket lands under Rootdir rather
+// than the process CWD. Without rooting, xattr.Set on the relative "bkt/obj"
+// would target the CWD and fail ENOENT, so this test fails without the fix.
+func TestAf2DescRootdir(t *testing.T) {
+	// rooted() resolution.
+	a := NewAf2Desc(0)
+	a.Rootdir = "/root"
+	if got := a.rooted("bkt", "obj"); got != "/root/bkt/obj" {
+		t.Fatalf("rooted relative = %q, want /root/bkt/obj", got)
+	}
+	if got := a.rooted("/abs/bkt", "obj"); got != "/abs/bkt/obj" {
+		t.Fatalf("rooted absolute bucket = %q, want /abs/bkt/obj (IsAbs guard)", got)
+	}
+	a0 := NewAf2Desc(0)
+	if got := a0.rooted("bkt", "obj"); got != "bkt/obj" {
+		t.Fatalf("rooted empty Rootdir = %q, want bkt/obj", got)
+	}
+
+	// Path-based store/retrieve with a relative bucket, anchored at Rootdir.
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "bkt"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	p := filepath.Join(root, "bkt", "obj")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	s := NewAf2Desc(0)
+	s.Rootdir = root
+	if err := s.StoreAttribute(nil, "bkt", "obj", "etag", []byte("E")); err != nil {
+		t.Fatalf("rooted nil-fd store: %v", err)
+	}
+	// The DESC xattr must physically be at <root>/bkt/obj.
+	if _, err := xattr.Get(p, descXattrName); err != nil {
+		t.Fatalf("DESC xattr not written to rooted path %s: %v", p, err)
+	}
+	// A fresh instance with the same Rootdir reads it back from disk.
+	s2 := NewAf2Desc(0)
+	s2.Rootdir = root
+	if got, err := retr(t, s2, "bkt", "obj", "etag"); err != nil || got != "E" {
+		t.Fatalf("rooted disk read = %q, %v (want E)", got, err)
+	}
+}
+
 // TestAf2DescWarmedEntrySurvivesFirstStore covers the WarmCache inode fix: a
 // cache entry populated without a local fd (ino==0, as WarmCache and cold reads
 // do) must not be wiped by the first fd-based StoreAttribute — the real inode is

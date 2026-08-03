@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"log"
 	"math"
+	"path/filepath"
 
 	"github.com/urfave/cli/v2"
 	"github.com/versity/versitygw/backend/meta"
@@ -182,7 +183,15 @@ func runPosix(ctx *cli.Context) error {
 	var ms meta.MetadataStorer
 	switch {
 	case af2Desc:
-		ms = meta.NewAf2Desc(af2DescMaxBytes)
+		gwrootAbs, err := filepath.Abs(gwroot)
+		if err != nil {
+			return fmt.Errorf("get absolute path of %v: %w", gwroot, err)
+		}
+		desc := meta.NewAf2Desc(af2DescMaxBytes)
+		// Root path-based DESC xattr syscalls at the absolute gateway root; the
+		// posix backend no longer chdir's, so a bare bucket/object would resolve
+		// against the process CWD (mirrors the XattrMeta.Rootdir wiring below).
+		desc.Rootdir = gwrootAbs
 		// Surface the af2-desc metadata limitations at startup rather than
 		// leaving them silent: bucket-level ACL/ownership is held in the
 		// write-through cache only (SDFS getxattr is unimplemented), so it does
@@ -191,6 +200,7 @@ func runPosix(ctx *cli.Context) error {
 		// all (accepted and dropped) in this deployment scope.
 		log.Printf("af2-desc: bucket ACL/ownership metadata is cache-only and does not survive a restart")
 		log.Printf("af2-desc: object/bucket tagging, object-lock, and stored checksums are not persisted (dropped)")
+		ms = desc
 	case sidecar != "":
 		sc, err := meta.NewSideCar(sidecar)
 		if err != nil {
@@ -201,8 +211,12 @@ func runPosix(ctx *cli.Context) error {
 	case nometa:
 		ms = meta.NoMeta{}
 	default:
-		ms = meta.XattrMeta{}
-		err := meta.XattrMeta{}.Test(gwroot)
+		gwrootAbs, err := filepath.Abs(gwroot)
+		if err != nil {
+			return fmt.Errorf("get absolute path of %v: %w", gwroot, err)
+		}
+		ms = meta.XattrMeta{Rootdir: gwrootAbs}
+		err = meta.XattrMeta{}.Test(gwroot)
 		if err != nil {
 			return fmt.Errorf("xattr check failed: %w", err)
 		}
