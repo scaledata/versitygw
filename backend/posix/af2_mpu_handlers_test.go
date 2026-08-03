@@ -36,8 +36,7 @@ func ptrI32(i int32) *int32 { return &i }
 func ptrI64(i int64) *int64 { return &i }
 
 // newOtterBackend builds a Posix backend in Otter mode (sameDirTmp + Af2Desc)
-// rooted at a temp dir, with one bucket created. New() chdir's to the root, so
-// bucket-relative paths resolve.
+// rooted at a temp dir, with one bucket created.
 func newOtterBackend(t *testing.T) (*Posix, string) {
 	return newOtterBackendCap(t, 0) // 0 => 64 MiB default in-memory buffer cap
 }
@@ -57,7 +56,7 @@ func newOtterBackendCap(t *testing.T, bufMax int64) (*Posix, string) {
 	if err != nil {
 		t.Fatalf("new posix backend: %v", err)
 	}
-	if err := os.Mkdir("buck", 0755); err != nil {
+	if err := os.Mkdir(filepath.Join(gw, "buck"), 0755); err != nil {
 		t.Fatalf("mkdir bucket: %v", err)
 	}
 	return be, "buck"
@@ -145,7 +144,7 @@ func TestOtterMPUFastPathOutOfOrder(t *testing.T) {
 	}
 
 	// Object bytes equal the in-order concatenation.
-	got, err := os.ReadFile(filepath.Join(bucket, key))
+	got, err := os.ReadFile(be.rooted(bucket, key))
 	if err != nil {
 		t.Fatalf("read object: %v", err)
 	}
@@ -155,7 +154,7 @@ func TestOtterMPUFastPathOutOfOrder(t *testing.T) {
 	}
 
 	// No residue: the data file is gone.
-	if _, err := os.Stat(mpDataFilePath(bucket, key, uploadID)); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(be.rooted(mpDataFilePath(bucket, key, uploadID))); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("data file residue: %v", err)
 	}
 
@@ -202,18 +201,18 @@ func TestOtterMPUNonUniformRejected(t *testing.T) {
 		t.Fatalf("expected Complete to reject the non-uniform interior part")
 	}
 	// No object may be revealed on the rejected path.
-	if _, statErr := os.Stat(filepath.Join(bucket, key)); !errors.Is(statErr, fs.ErrNotExist) {
+	if _, statErr := os.Stat(be.rooted(bucket, key)); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Fatalf("object revealed despite non-uniform rejection: %v", statErr)
 	}
 }
 
 // assertNoMpResidue fails if the upload's .data or .stash side files remain.
-func assertNoMpResidue(t *testing.T, bucket, key, uploadID string) {
+func assertNoMpResidue(t *testing.T, be *Posix, bucket, key, uploadID string) {
 	t.Helper()
-	if _, err := os.Stat(mpDataFilePath(bucket, key, uploadID)); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(be.rooted(mpDataFilePath(bucket, key, uploadID))); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("data file residue: %v", err)
 	}
-	if _, err := os.Stat(mpStashFilePath(bucket, key, uploadID)); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(be.rooted(mpStashFilePath(bucket, key, uploadID))); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("stash file residue: %v", err)
 	}
 }
@@ -259,7 +258,7 @@ func TestOtterMPUShortFinalPartFirst(t *testing.T) {
 		t.Fatalf("composite ETag = %s, want -3 suffix", *res.ETag)
 	}
 
-	got, err := os.ReadFile(filepath.Join(bucket, key))
+	got, err := os.ReadFile(be.rooted(bucket, key))
 	if err != nil {
 		t.Fatalf("read object: %v", err)
 	}
@@ -273,7 +272,7 @@ func TestOtterMPUShortFinalPartFirst(t *testing.T) {
 		t.Fatalf("reveal kind = %v, want revealNoCopy", revealKind(be.lastRevealKind.Load()))
 	}
 	// Both side files are gone.
-	assertNoMpResidue(t, bucket, key, uploadID)
+	assertNoMpResidue(t, be, bucket, key, uploadID)
 }
 
 // TestOtterMPUSinglePart: a single-part upload (any size, exempt from
@@ -297,7 +296,7 @@ func TestOtterMPUSinglePart(t *testing.T) {
 	if !strings.HasSuffix(strings.Trim(*res.ETag, `"`), "-1") {
 		t.Fatalf("composite ETag = %s, want -1 suffix", *res.ETag)
 	}
-	got, err := os.ReadFile(filepath.Join(bucket, key))
+	got, err := os.ReadFile(be.rooted(bucket, key))
 	if err != nil {
 		t.Fatalf("read object: %v", err)
 	}
@@ -307,7 +306,7 @@ func TestOtterMPUSinglePart(t *testing.T) {
 	if revealKind(be.lastRevealKind.Load()) != revealNoCopy {
 		t.Fatalf("reveal kind = %v, want revealNoCopy", revealKind(be.lastRevealKind.Load()))
 	}
-	assertNoMpResidue(t, bucket, key, uploadID)
+	assertNoMpResidue(t, be, bucket, key, uploadID)
 }
 
 // TestOtterMPUStashFoldNoTail: full parts 2 and 3 arrive before part 1 (so they
@@ -343,7 +342,7 @@ func TestOtterMPUStashFoldNoTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	got, err := os.ReadFile(filepath.Join(bucket, key))
+	got, err := os.ReadFile(be.rooted(bucket, key))
 	if err != nil {
 		t.Fatalf("read object: %v", err)
 	}
@@ -358,7 +357,7 @@ func TestOtterMPUStashFoldNoTail(t *testing.T) {
 		t.Fatalf("reveal kind = %v, want revealNoCopy", revealKind(be.lastRevealKind.Load()))
 	}
 	_ = res
-	assertNoMpResidue(t, bucket, key, uploadID)
+	assertNoMpResidue(t, be, bucket, key, uploadID)
 }
 
 // TestOtterMPUListDuringBuffer: ListParts during the pre-stride window (a short
@@ -390,7 +389,7 @@ func TestOtterMPUListDuringBuffer(t *testing.T) {
 	}
 
 	// A small buffered part stays in RAM: no spill file is created.
-	if _, err := os.Stat(mpStashFilePath(bucket, key, uploadID)); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(be.rooted(mpStashFilePath(bucket, key, uploadID))); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("small buffered part should not create a spill file: %v", err)
 	}
 
@@ -399,7 +398,7 @@ func TestOtterMPUListDuringBuffer(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("abort: %v", err)
 	}
-	assertNoMpResidue(t, bucket, key, uploadID)
+	assertNoMpResidue(t, be, bucket, key, uploadID)
 }
 
 // TestOtterMPUMisorderedCompleteRejected is the corruption guard (FV9): a
@@ -426,7 +425,7 @@ func TestOtterMPUMisorderedCompleteRejected(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected mis-ordered Complete to be rejected")
 	}
-	if _, statErr := os.Stat(filepath.Join(bucket, key)); !errors.Is(statErr, fs.ErrNotExist) {
+	if _, statErr := os.Stat(be.rooted(bucket, key)); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Fatalf("object revealed despite mis-ordered rejection: %v", statErr)
 	}
 }
@@ -448,7 +447,7 @@ func TestOtterMPUOversizedPartSpills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upload part 2: %v", err)
 	}
-	if _, err := os.Stat(mpStashFilePath(bucket, key, uploadID)); err != nil {
+	if _, err := os.Stat(be.rooted(mpStashFilePath(bucket, key, uploadID))); err != nil {
 		t.Fatalf("expected spill file for oversized pre-stride part: %v", err)
 	}
 
@@ -457,7 +456,7 @@ func TestOtterMPUOversizedPartSpills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upload part 1: %v", err)
 	}
-	if _, err := os.Stat(mpStashFilePath(bucket, key, uploadID)); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(be.rooted(mpStashFilePath(bucket, key, uploadID))); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("spill file not removed after flush: %v", err)
 	}
 
@@ -468,7 +467,7 @@ func TestOtterMPUOversizedPartSpills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	got, err := os.ReadFile(filepath.Join(bucket, key))
+	got, err := os.ReadFile(be.rooted(bucket, key))
 	if err != nil {
 		t.Fatalf("read object: %v", err)
 	}
@@ -476,7 +475,7 @@ func TestOtterMPUOversizedPartSpills(t *testing.T) {
 		t.Fatalf("object bytes mismatch: got %d, want %d", len(got), len(want))
 	}
 	_ = res
-	assertNoMpResidue(t, bucket, key, uploadID)
+	assertNoMpResidue(t, be, bucket, key, uploadID)
 }
 
 // TestOtterMPUReuploadAccounting (FV10): re-uploading a still-buffered part must
@@ -592,7 +591,7 @@ func TestOtterMPUListAndAbort(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("abort: %v", err)
 	}
-	if _, err := os.Stat(mpDataFilePath(bucket, key, uploadID)); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(be.rooted(mpDataFilePath(bucket, key, uploadID))); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("data file not removed on abort: %v", err)
 	}
 	lmu2, _ := be.ListMultipartUploads(context.Background(), &s3.ListMultipartUploadsInput{

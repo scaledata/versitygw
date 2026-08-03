@@ -81,8 +81,10 @@ func (p *Posix) openTmpFile(dir, bucket, obj string, size int64, acct auth.Accou
 	f := os.NewFile(uintptr(fd), filepath.Join(procfddir, strconv.Itoa(fd)))
 
 	tmp := &tmpfile{
-		f:          f,
-		bucket:     bucket,
+		f: f,
+		// Root the bucket so the reveal (link/rename) targets rootdir/bucket/obj,
+		// not a CWD-relative path — New no longer os.Chdir's into rootdir.
+		bucket:     p.rooted(bucket),
 		objname:    obj,
 		isOTmp:     true,
 		size:       size,
@@ -124,8 +126,9 @@ func (p *Posix) openMkTemp(dir, bucket, obj string, size int64, dofalloc bool, u
 		return nil, err
 	}
 	tmp := &tmpfile{
-		f:       f,
-		bucket:  bucket,
+		f: f,
+		// Root the bucket (see openTmpFile) so the reveal targets rootdir/bucket/obj.
+		bucket:  p.rooted(bucket),
 		objname: obj,
 		size:    size,
 		doChown: doChown,

@@ -480,8 +480,8 @@ func (p *Posix) uploadPartAtOffset(bucket, object, uploadID string, partNum int,
 		// Fresh in-memory index: drop any scratch a prior attempt left on disk
 		// under this uploadID (e.g. across a gateway restart) so stale bytes
 		// cannot survive into this attempt.
-		_ = os.Remove(mpDataFilePath(bucket, object, uploadID))
-		_ = os.Remove(mpStashFilePath(bucket, object, uploadID))
+		_ = os.Remove(p.rooted(mpDataFilePath(bucket, object, uploadID)))
+		_ = os.Remove(p.rooted(mpStashFilePath(bucket, object, uploadID)))
 	}
 
 	offset, disp, newStride := idx.classify(partNum, length)
@@ -513,7 +513,7 @@ func (p *Posix) uploadPartAtOffset(bucket, object, uploadID string, partNum int,
 	var written int64
 	switch disp {
 	case dispPlace:
-		dataPath := mpDataFilePath(bucket, object, uploadID)
+		dataPath := p.rooted(mpDataFilePath(bucket, object, uploadID))
 		if err := os.MkdirAll(filepath.Dir(dataPath), p.newDirPerm); err != nil {
 			return nil, fmt.Errorf("create object dir: %w", err)
 		}
@@ -554,7 +554,7 @@ func (p *Posix) uploadPartAtOffset(bucket, object, uploadID string, partNum int,
 			idx.pending[partNum] = &pendingPart{data: data, length: written}
 			idx.pendingRAM += written
 		} else {
-			spillPath := mpStashFilePath(bucket, object, uploadID)
+			spillPath := p.rooted(mpStashFilePath(bucket, object, uploadID))
 			if err := os.MkdirAll(filepath.Dir(spillPath), p.newDirPerm); err != nil {
 				return nil, fmt.Errorf("create object dir: %w", err)
 			}
@@ -613,7 +613,7 @@ func (p *Posix) flushPending(bucket, object, uploadID string, idx *otterMpuIndex
 	if len(idx.pending) == 0 {
 		return nil
 	}
-	dataPath := mpDataFilePath(bucket, object, uploadID)
+	dataPath := p.rooted(mpDataFilePath(bucket, object, uploadID))
 	if err := os.MkdirAll(filepath.Dir(dataPath), p.newDirPerm); err != nil {
 		return fmt.Errorf("create object dir: %w", err)
 	}
@@ -635,7 +635,7 @@ func (p *Posix) flushPending(bucket, object, uploadID string, idx *otterMpuIndex
 		off := int64(pn-1) * idx.Stride
 		if pp.spilled {
 			if sf == nil {
-				sf, err = os.Open(mpStashFilePath(bucket, object, uploadID))
+				sf, err = os.Open(p.rooted(mpStashFilePath(bucket, object, uploadID)))
 				if err != nil {
 					return fmt.Errorf("open mpu spill file: %w", err)
 				}
@@ -659,7 +659,7 @@ func (p *Posix) flushPending(bucket, object, uploadID string, idx *otterMpuIndex
 			sf.Close()
 			sf = nil
 		}
-		_ = os.Remove(mpStashFilePath(bucket, object, uploadID))
+		_ = os.Remove(p.rooted(mpStashFilePath(bucket, object, uploadID)))
 		idx.spillNext = 0
 	}
 	return nil
@@ -698,8 +698,8 @@ func (p *Posix) completeMultipartAtOffset(acct auth.Account, input *s3.CompleteM
 	mu.Lock()
 	defer mu.Unlock()
 
-	dataPath := mpDataFilePath(bucket, object, uploadID)
-	finalPath := filepath.Join(bucket, object)
+	dataPath := p.rooted(mpDataFilePath(bucket, object, uploadID))
+	finalPath := p.rooted(bucket, object)
 
 	// Idempotency: the on-disk upload state is gone. If the final object exists,
 	// a prior Complete already succeeded — return success; else it never existed.
@@ -811,7 +811,7 @@ func (p *Posix) completeMultipartAtOffset(acct auth.Account, input *s3.CompleteM
 	if err := os.Truncate(dataPath, dataSize); err != nil {
 		return res, "", fmt.Errorf("truncate mpu data file: %w", err)
 	}
-	_ = os.Remove(mpStashFilePath(bucket, object, uploadID))
+	_ = os.Remove(p.rooted(mpStashFilePath(bucket, object, uploadID)))
 
 	if err := os.MkdirAll(filepath.Dir(finalPath), p.newDirPerm); err != nil {
 		return res, "", fmt.Errorf("create object dir: %w", err)
@@ -882,7 +882,7 @@ func (p *Posix) revealMpu(acct auth.Account, input *s3.CompleteMultipartUploadIn
 
 	// content-type / user metadata captured at Create live in the upload-meta
 	// plain file (not a DESC attr, since the state dir is a directory).
-	mprops, err := readMpUploadMeta(mpUploadMetaPath(bucket, object, uploadID))
+	mprops, err := readMpUploadMeta(p.rooted(mpUploadMetaPath(bucket, object, uploadID)))
 	if err != nil {
 		mprops = metaProperties{} // best-effort
 	}
@@ -959,17 +959,17 @@ func (p *Posix) revealMpu(acct auth.Account, input *s3.CompleteMultipartUploadIn
 	}
 
 	// Cleanup: state dir, spill, hash dir, in-memory index, lock entry.
-	_ = os.Remove(mpStashFilePath(bucket, object, uploadID))
-	os.RemoveAll(mpStateDir(bucket, object, uploadID))
-	cleanupMpHashDir(mpHashDir(bucket, object))
+	_ = os.Remove(p.rooted(mpStashFilePath(bucket, object, uploadID)))
+	os.RemoveAll(p.rooted(mpStateDir(bucket, object, uploadID)))
+	cleanupMpHashDir(p.rooted(mpHashDir(bucket, object)))
 	p.delMpuIndex(bucket, object, uploadID)
 	p.mpuUnlockDelete(bucket, object, uploadID)
 
 	fullObject := types.ChecksumTypeFullObject
 	return s3response.CompleteMultipartUploadResult{
-		Bucket:            &bucket,
-		ETag:              &s3MD5,
-		Key:               &object,
+		Bucket:         &bucket,
+		ETag:           &s3MD5,
+		Key:            &object,
 		ChecksumCRC32C: &crc,
 		ChecksumType:   &fullObject,
 	}, "", nil
@@ -1001,7 +1001,7 @@ func (p *Posix) listPartsFromIndex(bucket, object, uploadID string, marker, maxP
 	idx, _ := p.peekMpuIndex(bucket, object, uploadID)
 
 	var modTime time.Time
-	if fi, statErr := os.Stat(mpDataFilePath(bucket, object, uploadID)); statErr == nil {
+	if fi, statErr := os.Stat(p.rooted(mpDataFilePath(bucket, object, uploadID))); statErr == nil {
 		modTime = fi.ModTime()
 	}
 
@@ -1055,7 +1055,7 @@ func (p *Posix) listPartsFromIndex(bucket, object, uploadID string, marker, maxP
 // objname file first (written by the Af2 path so it survives the DESC storer
 // dropping the onameAttr attribute) and falling back to the metadata storer.
 func (p *Posix) readMpObjName(bucket, hashName string) (string, error) {
-	b, err := os.ReadFile(filepath.Join(bucket, MetaTmpMultipartDir, hashName, onameAttr))
+	b, err := os.ReadFile(p.rooted(bucket, MetaTmpMultipartDir, hashName, onameAttr))
 	if err == nil {
 		return string(b), nil
 	}
@@ -1099,10 +1099,10 @@ func cleanupMpHashDir(hashDir string) {
 type Af2MPUHandler struct{}
 
 func (Af2MPUHandler) CreateMultipartUpload(_ context.Context, p *Posix, mpu s3response.CreateMultipartUploadInput, bucket, object, uploadID string) (s3response.InitiateMultipartUploadResult, error) {
-	if err := os.WriteFile(mpObjNamePath(bucket, object), []byte(object), 0600); err != nil {
+	if err := os.WriteFile(p.rooted(mpObjNamePath(bucket, object)), []byte(object), 0600); err != nil {
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("write mpu objname: %w", err)
 	}
-	if err := writeMpUploadMeta(mpUploadMetaPath(bucket, object, uploadID), metaProperties{
+	if err := writeMpUploadMeta(p.rooted(mpUploadMetaPath(bucket, object, uploadID)), metaProperties{
 		ContentType:        mpu.ContentType,
 		ContentEncoding:    mpu.ContentEncoding,
 		ContentDisposition: mpu.ContentDisposition,
@@ -1135,10 +1135,10 @@ func (Af2MPUHandler) AbortMultipartUpload(_ context.Context, p *Posix, input *s3
 	mu.Lock()
 	defer mu.Unlock()
 
-	os.Remove(mpDataFilePath(bucket, object, uploadID))
-	os.Remove(mpStashFilePath(bucket, object, uploadID))
-	os.RemoveAll(mpStateDir(bucket, object, uploadID))
-	cleanupMpHashDir(mpHashDir(bucket, object))
+	os.Remove(p.rooted(mpDataFilePath(bucket, object, uploadID)))
+	os.Remove(p.rooted(mpStashFilePath(bucket, object, uploadID)))
+	os.RemoveAll(p.rooted(mpStateDir(bucket, object, uploadID)))
+	cleanupMpHashDir(p.rooted(mpHashDir(bucket, object)))
 	p.delMpuIndex(bucket, object, uploadID)
 	p.mpuUnlockDelete(bucket, object, uploadID)
 	return nil
