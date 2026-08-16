@@ -105,6 +105,11 @@ func New(local backend.Backend, peers []backend.Backend, m *OwnerMap, selfIdx in
 // handoff indefinitely.
 const reconfigureDrainTimeout = 30 * time.Second
 
+// Local returns the current node-local backend. A grant that carries no owned
+// slot for this node reconfigures the peer table only, and needs the existing
+// local backend to hand back to Reconfigure unchanged.
+func (r *Router) Local() backend.Backend { return r.cfg.Load().local }
+
 // Reconfigure atomically installs a new local backend and peer slice.
 // chanSem is acquired to drain any in-flight local byte-write first (P=1 invariant).
 // Reads (GetObject etc.) are lock-free — they load a snapshot once per request

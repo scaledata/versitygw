@@ -15,6 +15,8 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
 	"io/fs"
 	"math"
@@ -25,9 +27,12 @@ import (
 	"github.com/urfave/cli/v2"
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/backend/meta"
+	"github.com/versity/versitygw/backend/noderesolver"
 	"github.com/versity/versitygw/backend/posix"
 	"github.com/versity/versitygw/backend/router"
 	"github.com/versity/versitygw/backend/s3proxy"
+	"github.com/versity/versitygw/otter/controlgrpc"
+	"github.com/versity/versitygw/otter/grant"
 )
 
 var (
@@ -44,6 +49,29 @@ var (
 	af2WarmPartitionID int
 	af2WarmCertFile    string
 	af2WarmKeyFile     string
+
+	// selfNodeId identifies this node's owned slot by CDM node id rather than by
+	// position. The owner map's slot ordering is a bootstrap artifact; a grant
+	// carries its own slot list, so matching by node id keeps this node pointed
+	// at the right channel even when the grant reorders slots.
+	selfNodeId string
+
+	// control* configure the JFL grant-push endpoint. Empty --control-addr
+	// leaves the control plane off entirely and the gateway owner-map driven.
+	controlAddr     string
+	controlTLS      bool
+	controlCertFile string
+	controlKeyFile  string
+	controlCAFile   string
+
+	// grants* configure CRDB access. Node resolution (sd.node) and durable grant
+	// storage are deliberately separate flags: they are independent tables, and
+	// gating both on one flag meant a missing grant table stopped peer-IP
+	// resolution from ever running.
+	grantsCRDBHost     string
+	grantsCRDBDB       string
+	grantsCRDBDurable  bool
+	grantLookupTimeout time.Duration
 )
 
 func otterCommand() *cli.Command {
@@ -66,10 +94,72 @@ as the argument and the shared owner map via --owner-map.`,
 			},
 			&cli.IntFlag{
 				Name:        "self-idx",
-				Usage:       "this node's slot index in the owner map (0..n-1); the only per-node difference",
+				Usage:       "this node's slot index in the owner map (0..n-1); fallback when --self-node-id is not set",
 				EnvVars:     []string{"OTTER_SELF_IDX"},
 				Destination: &selfIdxFlag,
 				Required:    true,
+			},
+			&cli.StringFlag{
+				Name:        "self-node-id",
+				Usage:       "this node's CDM node id; when set, the owned slot is the grant slot whose nodeId matches, rather than --self-idx",
+				EnvVars:     []string{"OTTER_SELF_NODE_ID"},
+				Destination: &selfNodeId,
+			},
+			&cli.StringFlag{
+				Name:        "control-addr",
+				Usage:       "listen address for the OtterControlService gRPC grant-push endpoint (empty disables the control plane)",
+				EnvVars:     []string{"OTTER_CONTROL_ADDR"},
+				Destination: &controlAddr,
+			},
+			&cli.BoolFlag{
+				Name:        "control-tls",
+				Usage:       "terminate mutual TLS on the control endpoint using --control-cert/--control-key/--control-ca",
+				EnvVars:     []string{"OTTER_CONTROL_TLS"},
+				Destination: &controlTLS,
+			},
+			&cli.StringFlag{
+				Name:        "control-cert",
+				Usage:       "server certificate for the control endpoint (requires --control-tls)",
+				EnvVars:     []string{"OTTER_CONTROL_CERT"},
+				Destination: &controlCertFile,
+			},
+			&cli.StringFlag{
+				Name:        "control-key",
+				Usage:       "server private key for the control endpoint (requires --control-tls)",
+				EnvVars:     []string{"OTTER_CONTROL_KEY"},
+				Destination: &controlKeyFile,
+			},
+			&cli.StringFlag{
+				Name:        "control-ca",
+				Usage:       "CA bundle used to verify JFL client certificates (requires --control-tls)",
+				EnvVars:     []string{"OTTER_CONTROL_CA"},
+				Destination: &controlCAFile,
+			},
+			&cli.StringFlag{
+				Name:        "grants-crdb-host",
+				Usage:       "CRDB host for sd.node peer-IP resolution; also the host used for durable grants when --grants-crdb-durable is set",
+				EnvVars:     []string{"OTTER_GRANTS_CRDB_HOST"},
+				Destination: &grantsCRDBHost,
+			},
+			&cli.StringFlag{
+				Name:        "grants-crdb-db",
+				Usage:       "CRDB database holding the durable grant table",
+				EnvVars:     []string{"OTTER_GRANTS_CRDB_DB"},
+				Value:       "defaultdb",
+				Destination: &grantsCRDBDB,
+			},
+			&cli.BoolFlag{
+				Name:        "grants-crdb-durable",
+				Usage:       "read grants from CRDB on cache miss and warm the cache at startup (requires --grants-crdb-host)",
+				EnvVars:     []string{"OTTER_GRANTS_CRDB_DURABLE"},
+				Destination: &grantsCRDBDurable,
+			},
+			&cli.DurationFlag{
+				Name:        "grant-lookup-timeout",
+				Usage:       "deadline for a single CRDB grant lookup on the resolve path",
+				EnvVars:     []string{"OTTER_GRANT_LOOKUP_TIMEOUT"},
+				Value:       2 * time.Second,
+				Destination: &grantLookupTimeout,
 			},
 			&cli.DurationFlag{
 				Name:        "forward-timeout",
@@ -312,5 +402,223 @@ func runOtter(ctx *cli.Context) error {
 		return err
 	}
 
+	if err := startControlPlane(ctx, gwroot, r, ms, opts); err != nil {
+		return err
+	}
+
 	return runGateway(ctx.Context, r)
+}
+
+// startControlPlane brings up the JFL grant-push endpoint when --control-addr is
+// set, and is a no-op otherwise. On grant upsert it fires a background goroutine
+// that resolves slot IPs from sd.node, builds a new posix backend rooted at the
+// granted ChannelPath, and calls Router.Reconfigure to switch the write path.
+//
+// Without this, the gateway is owner-map driven: grant, Resolver and Reconfigure
+// all exist but nothing delivers a grant, so the upsert hook never fires.
+func startControlPlane(ctx *cli.Context, gwroot string, r *router.Router, ms meta.MetadataStorer, opts posix.PosixOpts) error {
+	if controlAddr == "" {
+		return nil
+	}
+
+	var nodeRes *noderesolver.Resolver
+	var src grant.Source
+	if grantsCRDBHost != "" {
+		nr, nrerr := noderesolver.New(ctx.Context, grantsCRDBHost, "sd")
+		if nrerr != nil {
+			return fmt.Errorf("otter control: CRDB node resolver: %w", nrerr)
+		}
+		nodeRes = nr
+
+		if grantsCRDBDurable {
+			s, serr := grant.NewCRDBSource(ctx.Context, grant.CRDBDSN(grantsCRDBHost, grantsCRDBDB))
+			if serr != nil {
+				return fmt.Errorf("otter control: CRDB grant source: %w", serr)
+			}
+			src = s
+		}
+	} else if grantsCRDBDurable {
+		return fmt.Errorf("otter control: --grants-crdb-durable requires --grants-crdb-host")
+	}
+
+	resolver := grant.NewResolver(
+		grant.WithSource(src),
+		grant.WithLookupTimeout(grantLookupTimeout),
+		grant.WithUpsertHook(func(g grant.Grant) error {
+			fmt.Fprintf(os.Stderr,
+				"info: grant upsert access=%s bucket=%s epoch=%d n=%d - launching reconfigure\n",
+				g.AccessKeyID, g.Bucket, g.Epoch, g.N())
+			// Deliberately detached from the RPC: reconfiguration retries with
+			// backoff and can outlive the caller's deadline. The grant is already
+			// cached, so a failed apply is retried by re-pushing the same epoch.
+			go applyGrant(context.Background(), g, r, nodeRes, gwroot, ms, opts)
+			return nil
+		}),
+	)
+
+	if src != nil {
+		n, werr := resolver.Warm(ctx.Context)
+		if werr != nil {
+			return fmt.Errorf("otter control: warm grants from CRDB: %w", werr)
+		}
+		fmt.Fprintf(os.Stderr, "info: warmed %d grant(s) from CRDB\n", n)
+	}
+
+	var tlsCfg *tls.Config
+	if controlTLS {
+		cfg, terr := controlgrpc.ServerTLSConfig(controlCertFile, controlKeyFile, controlCAFile)
+		if terr != nil {
+			return fmt.Errorf("otter control: TLS config: %w", terr)
+		}
+		tlsCfg = cfg
+	}
+
+	srv, serr := controlgrpc.NewServer(controlgrpc.NewHandler(resolver), controlAddr, tlsCfg)
+	if serr != nil {
+		return serr
+	}
+	go func() {
+		fmt.Fprintf(os.Stderr, "info: OtterControlService(gRPC) listening on %s (tls=%v)\n", controlAddr, controlTLS)
+		if e := srv.Serve(); e != nil {
+			fmt.Fprintf(os.Stderr, "error: OtterControlService(gRPC) server exited: %v\n", e)
+		}
+	}()
+	return nil
+}
+
+// applyGrant retries doApplyGrant with backoff: the usual failures are transient
+// (CRDB not up, granted channel path not yet mounted). On exhaustion the gateway
+// stays on its previous write path rather than losing one, and re-pushing the
+// same grant epoch retries.
+func applyGrant(ctx context.Context, g grant.Grant, r *router.Router, nodeRes *noderesolver.Resolver, gwroot string, ms meta.MetadataStorer, opts posix.PosixOpts) {
+	backoff := []time.Duration{200 * time.Millisecond, time.Second, 5 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt <= 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(backoff[attempt-1])
+		}
+		if err := doApplyGrant(ctx, g, r, nodeRes, gwroot, ms, opts); err != nil {
+			lastErr = err
+			fmt.Fprintf(os.Stderr, "warn: grant-driven reconfigure attempt %d/3 failed: %v\n", attempt+1, err)
+			continue
+		}
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"warn: grant-driven reconfigure failed after 3 attempts - staying on previous write path; re-push the grant to retry. Last error: %v\n",
+		lastErr)
+}
+
+func doApplyGrant(ctx context.Context, g grant.Grant, r *router.Router, nodeRes *noderesolver.Resolver, gwroot string, ms meta.MetadataStorer, opts posix.PosixOpts) error {
+	fmt.Fprintf(os.Stderr, "info: applying grant clientId=%s access=%s bucket=%s epoch=%d n=%d policy=%v\n",
+		g.ClientID, g.AccessKeyID, g.Bucket, g.Epoch, g.N(), g.Policy)
+	for i, s := range g.Slots {
+		fmt.Fprintf(os.Stderr, "info:   slot[%d] nodeId=%s channelPath=%s endpoint=%q\n",
+			i, s.NodeID, s.ChannelPath, s.Endpoint)
+	}
+
+	// Locate this node's slot. ownedIdx == -1 means the grant gives this node no
+	// channel of its own, so it installs a forwarding table and writes nothing
+	// locally. Router.Reconfigure treats -1 as "matches no place() result".
+	ownedIdx := -1
+	if selfNodeId != "" {
+		for i, s := range g.Slots {
+			if s.NodeID == selfNodeId {
+				ownedIdx = i
+				break
+			}
+		}
+		if ownedIdx < 0 {
+			fmt.Fprintf(os.Stderr, "info: grant has no owned slot for selfNodeId=%s - installing forwarding table only\n", selfNodeId)
+		}
+	} else if selfIdxFlag < len(g.Slots) {
+		ownedIdx = selfIdxFlag
+	} else {
+		return fmt.Errorf("grant has %d slot(s) but --self-idx is %d and --self-node-id is unset; cannot identify this node's slot",
+			len(g.Slots), selfIdxFlag)
+	}
+
+	// Same rule as startup: never fall back to well-known credentials. A grant
+	// with more than one slot means this node may forward, and a silent default
+	// would sign peer requests with publicly-known keys.
+	access := os.Getenv("ROOT_ACCESS_KEY")
+	secret := os.Getenv("ROOT_SECRET_KEY")
+	if len(g.Slots) > 1 && (access == "" || secret == "") {
+		return fmt.Errorf("ROOT_ACCESS_KEY and ROOT_SECRET_KEY must both be set to forward for a multi-slot grant (n=%d); refusing to build peers with default credentials", len(g.Slots))
+	}
+	const region = "us-east-1"
+
+	peers := make([]backend.Backend, len(g.Slots))
+	for i, s := range g.Slots {
+		if i == ownedIdx {
+			continue // owned locally; never forwarded to self
+		}
+		endpoint := s.Endpoint
+		if endpoint == "" && nodeRes != nil {
+			ip, found, err := nodeRes.DataIP(ctx, s.NodeID)
+			if err != nil {
+				return fmt.Errorf("resolve nodeId %s: %w", s.NodeID, err)
+			}
+			if !found {
+				fmt.Fprintf(os.Stderr, "warn: grant slot[%d] nodeId=%s not found in sd.node - skipping peer\n", i, s.NodeID)
+				continue
+			}
+			endpoint = fmt.Sprintf("http://%s:9000", ip)
+			fmt.Fprintf(os.Stderr, "info: grant slot[%d] resolved dataIP=%s endpoint=%s\n", i, ip, endpoint)
+		}
+		if endpoint == "" {
+			continue
+		}
+		pxy, perr := s3proxy.New(ctx, access, secret, endpoint, region,
+			"",    // metaBucket
+			false, // anonymousCredentials
+			true,  // disableChecksum
+			true,  // disableDataIntegrityCheck
+			true,  // sslSkipVerify
+			true,  // usePathStyle
+			false, // debug
+			false, // gcsCompatibility
+		)
+		if perr != nil {
+			return fmt.Errorf("init peer for slot %d: %w", i, perr)
+		}
+		peers[i] = pxy
+	}
+
+	// Forwarder-only: keep the existing local backend, install the peer table.
+	if ownedIdx < 0 {
+		if err := r.Reconfigure(ctx, r.Local(), peers, ownedIdx, len(g.Slots)); err != nil {
+			return fmt.Errorf("reconfigure (forwarder only): %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "info: grant-driven forwarding table installed (no local write path)\n")
+		return nil
+	}
+
+	ownedSlot := g.Slots[ownedIdx]
+	writeRoot := gwroot
+	if ownedSlot.ChannelPath != "" {
+		writeRoot = ownedSlot.ChannelPath
+	}
+	fmt.Fprintf(os.Stderr, "info: grant-driven write path -> %s (slot[%d] nodeId=%s)\n",
+		writeRoot, ownedIdx, ownedSlot.NodeID)
+
+	newLocal, err := posix.New(writeRoot, ms, opts)
+	if err != nil {
+		return fmt.Errorf("init local backend at %s: %w", writeRoot, err)
+	}
+
+	if err := r.Reconfigure(ctx, newLocal, peers, ownedIdx, len(g.Slots)); err != nil {
+		// Reconfigure did not take, so this backend was never installed and
+		// nothing else can reach it; release it rather than leaking its root fd.
+		newLocal.Shutdown()
+		return fmt.Errorf("reconfigure to %s: %w", writeRoot, err)
+	}
+
+	bucketDir := filepath.Join(writeRoot, g.Bucket)
+	if mkErr := os.MkdirAll(bucketDir, fs.FileMode(dirPerms)); mkErr != nil {
+		fmt.Fprintf(os.Stderr, "warn: grant-driven mkdir %q: %v\n", bucketDir, mkErr)
+	} else {
+		fmt.Fprintf(os.Stderr, "info: grant-driven mkdir %s\n", bucketDir)
+	}
+	return nil
 }
