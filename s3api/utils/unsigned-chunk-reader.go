@@ -35,7 +35,6 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/versity/versitygw/debuglogger"
 	"github.com/versity/versitygw/s3err"
-	"github.com/zeebo/xxh3"
 )
 
 var (
@@ -509,10 +508,6 @@ func getHasher(ct checksumType) (hash.Hash, error) {
 		return md5.New(), nil
 	case checksumTypeXxhash64:
 		return xxhash.New(), nil
-	case checksumTypeXxhash3:
-		return xxh3.New(), nil
-	case checksumTypeXxhash128:
-		return xxh3.New128(), nil
 	default:
 		return nil, errors.New("unsupported checksum type")
 	}

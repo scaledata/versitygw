@@ -120,7 +120,6 @@ func main() {
 		otterCommand(),
 		scoutfsCommand(),
 		s3Command(),
-		azureCommand(),
 		pluginCommand(),
 		adminCommand(),
 		testCommand(),

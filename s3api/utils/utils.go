@@ -740,8 +740,6 @@ var checksumLengths = map[types.ChecksumAlgorithm]int{
 	types.ChecksumAlgorithmSha256:    32,
 	types.ChecksumAlgorithmSha512:    64,
 	types.ChecksumAlgorithmXxhash64:  8,
-	types.ChecksumAlgorithmXxhash3:   8,
-	types.ChecksumAlgorithmXxhash128: 16,
 }
 
 func IsValidChecksum(checksum string, algorithm types.ChecksumAlgorithm) bool {
@@ -775,9 +773,7 @@ func IsChecksumAlgorithmValid(alg types.ChecksumAlgorithm) error {
 		alg != types.ChecksumAlgorithmCrc64nvme &&
 		alg != types.ChecksumAlgorithmSha512 &&
 		alg != types.ChecksumAlgorithmMd5 &&
-		alg != types.ChecksumAlgorithmXxhash64 &&
-		alg != types.ChecksumAlgorithmXxhash3 &&
-		alg != types.ChecksumAlgorithmXxhash128 {
+		alg != types.ChecksumAlgorithmXxhash64 {
 		debuglogger.Logf("invalid checksum algorithm: %v\n", alg)
 		return s3err.GetAPIError(s3err.ErrInvalidChecksumAlgorithm)
 	}
@@ -832,14 +828,6 @@ var checksumMap checksumSchema = checksumSchema{
 		"":                          struct{}{},
 	},
 	types.ChecksumAlgorithmXxhash64: checksumTypeSchema{
-		types.ChecksumTypeComposite: struct{}{},
-		"":                          struct{}{},
-	},
-	types.ChecksumAlgorithmXxhash3: checksumTypeSchema{
-		types.ChecksumTypeComposite: struct{}{},
-		"":                          struct{}{},
-	},
-	types.ChecksumAlgorithmXxhash128: checksumTypeSchema{
 		types.ChecksumTypeComposite: struct{}{},
 		"":                          struct{}{},
 	},

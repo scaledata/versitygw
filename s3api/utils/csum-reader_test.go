@@ -30,7 +30,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/cespare/xxhash/v2"
 	"github.com/stretchr/testify/assert"
-	"github.com/zeebo/xxh3"
 )
 
 func TestAddCRCChecksum_CRC32(t *testing.T) {
@@ -150,8 +149,6 @@ func TestNewHashReader_NewChecksumAlgorithms(t *testing.T) {
 		{name: "crc32c", hashType: HashTypeCRC32C, hasher: crc32.New(crc32.MakeTable(crc32.Castagnoli))},
 		{name: "crc64nvme", hashType: HashTypeCRC64NVME, hasher: crc64.New(crc64NVMETable)},
 		{name: "xxhash64", hashType: HashTypeXXHASH64, hasher: xxhash.New()},
-		{name: "xxhash3", hashType: HashTypeXXHASH3, hasher: xxh3.New()},
-		{name: "xxhash128", hashType: HashTypeXXHASH128, hasher: xxh3.New128()},
 	}
 
 	for _, tt := range tests {
@@ -184,8 +181,6 @@ func TestNewCompositeChecksumReader_NewChecksumAlgorithms(t *testing.T) {
 		{name: "crc32", hashType: HashTypeCRC32, newHasher: func() hash.Hash { return crc32.NewIEEE() }},
 		{name: "crc32c", hashType: HashTypeCRC32C, newHasher: func() hash.Hash { return crc32.New(crc32.MakeTable(crc32.Castagnoli)) }},
 		{name: "xxhash64", hashType: HashTypeXXHASH64, newHasher: func() hash.Hash { return xxhash.New() }},
-		{name: "xxhash3", hashType: HashTypeXXHASH3, newHasher: func() hash.Hash { return xxh3.New() }},
-		{name: "xxhash128", hashType: HashTypeXXHASH128, newHasher: func() hash.Hash { return xxh3.New128() }},
 	}
 
 	for _, tt := range tests {

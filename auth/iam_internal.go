@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	iamFile       = "users.json"
+	IAMFile       = "users.json"
 	iamBackupFile = "users.json.backup"
 )
 
@@ -47,8 +47,8 @@ type IAMServiceInternal struct {
 // UpdateAcctFunc accepts the current data and returns the new data to be stored
 type UpdateAcctFunc func([]byte) ([]byte, error)
 
-// iAMConfig stores all internal IAM accounts
-type iAMConfig struct {
+// IAMConfig stores all internal IAM accounts
+type IAMConfig struct {
 	AccessAccounts map[string]Account `json:"accessAccounts"`
 }
 
@@ -80,7 +80,7 @@ func (s *IAMServiceInternal) CreateAccount(account Account) error {
 	defer s.Unlock()
 
 	return s.storeIAM(func(data []byte) ([]byte, error) {
-		conf, err := parseIAM(data)
+		conf, err := ParseIAM(data)
 		if err != nil {
 			return nil, fmt.Errorf("get iam data: %w", err)
 		}
@@ -130,7 +130,7 @@ func (s *IAMServiceInternal) UpdateUserAccount(access string, props MutableProps
 	defer s.Unlock()
 
 	return s.storeIAM(func(data []byte) ([]byte, error) {
-		conf, err := parseIAM(data)
+		conf, err := ParseIAM(data)
 		if err != nil {
 			return nil, fmt.Errorf("get iam data: %w", err)
 		}
@@ -140,7 +140,7 @@ func (s *IAMServiceInternal) UpdateUserAccount(access string, props MutableProps
 			return nil, ErrNoSuchUser
 		}
 
-		updateAcc(&acc, props)
+		UpdateAcc(&acc, props)
 		conf.AccessAccounts[access] = acc
 
 		b, err := json.Marshal(conf)
@@ -159,7 +159,7 @@ func (s *IAMServiceInternal) DeleteUserAccount(access string) error {
 	defer s.Unlock()
 
 	return s.storeIAM(func(data []byte) ([]byte, error) {
-		conf, err := parseIAM(data)
+		conf, err := ParseIAM(data)
 		if err != nil {
 			return nil, fmt.Errorf("get iam data: %w", err)
 		}
@@ -216,11 +216,11 @@ const (
 )
 
 func (s *IAMServiceInternal) initIAM() error {
-	fname := filepath.Join(s.dir, iamFile)
+	fname := filepath.Join(s.dir, IAMFile)
 
 	_, err := os.ReadFile(fname)
 	if errors.Is(err, fs.ErrNotExist) {
-		b, err := json.Marshal(iAMConfig{AccessAccounts: map[string]Account{}})
+		b, err := json.Marshal(IAMConfig{AccessAccounts: map[string]Account{}})
 		if err != nil {
 			return fmt.Errorf("marshal default iam: %w", err)
 		}
@@ -233,19 +233,19 @@ func (s *IAMServiceInternal) initIAM() error {
 	return nil
 }
 
-func (s *IAMServiceInternal) getIAM() (iAMConfig, error) {
+func (s *IAMServiceInternal) getIAM() (IAMConfig, error) {
 	b, err := s.readIAMData()
 	if err != nil {
-		return iAMConfig{}, err
+		return IAMConfig{}, err
 	}
 
-	return parseIAM(b)
+	return ParseIAM(b)
 }
 
-func parseIAM(b []byte) (iAMConfig, error) {
-	var conf iAMConfig
+func ParseIAM(b []byte) (IAMConfig, error) {
+	var conf IAMConfig
 	if err := json.Unmarshal(b, &conf); err != nil {
-		return iAMConfig{}, fmt.Errorf("failed to parse the config file: %w", err)
+		return IAMConfig{}, fmt.Errorf("failed to parse the config file: %w", err)
 	}
 
 	if conf.AccessAccounts == nil {
@@ -270,7 +270,7 @@ func (s *IAMServiceInternal) readIAMData() ([]byte, error) {
 	retries := 0
 
 	for {
-		b, err := os.ReadFile(filepath.Join(s.dir, iamFile))
+		b, err := os.ReadFile(filepath.Join(s.dir, IAMFile))
 		if errors.Is(err, fs.ErrNotExist) {
 			// racing with someone else updating
 			// keep retrying after backoff
@@ -302,7 +302,7 @@ func (s *IAMServiceInternal) storeIAM(update UpdateAcctFunc) error {
 	// This should be rare, and even when it does happen should result
 	// in a valid IAM file, just without the other process's updates.
 
-	iamFname := filepath.Join(s.dir, iamFile)
+	iamFname := filepath.Join(s.dir, IAMFile)
 	backupFname := filepath.Join(s.dir, iamBackupFile)
 
 	b, err := os.ReadFile(iamFname)
@@ -334,7 +334,7 @@ func (s *IAMServiceInternal) storeIAM(update UpdateAcctFunc) error {
 }
 
 func (s *IAMServiceInternal) writeUsingTempFile(b []byte, fname string) error {
-	f, err := os.CreateTemp(s.dir, iamFile)
+	f, err := os.CreateTemp(s.dir, IAMFile)
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}

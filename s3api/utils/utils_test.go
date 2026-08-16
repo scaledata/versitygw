@@ -729,20 +729,6 @@ func TestIsChecksumAlgorithmValid(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "xxhash3",
-			args: args{
-				alg: types.ChecksumAlgorithmXxhash3,
-			},
-			wantErr: false,
-		},
-		{
-			name: "xxhash128",
-			args: args{
-				alg: types.ChecksumAlgorithmXxhash128,
-			},
-			wantErr: false,
-		},
-		{
 			name: "invalid",
 			args: args{
 				alg: types.ChecksumAlgorithm("invalid_checksum_algorithm"),
@@ -914,28 +900,12 @@ func TestIsValidChecksum(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "valid-xxhash3",
-			args: args{
-				checksum:  "LQaABTjTlMI=",
-				algorithm: types.ChecksumAlgorithmXxhash3,
-			},
-			want: true,
-		},
-		{
 			name: "invalid-xxhash128",
 			args: args{
 				checksum:  "70bbN1HY6Zk=",
 				algorithm: types.ChecksumAlgorithmXxhash128,
 			},
 			want: false,
-		},
-		{
-			name: "valid-xxhash128",
-			args: args{
-				checksum:  "maoG0wFHmNhgAcMkRo1Jfw==",
-				algorithm: types.ChecksumAlgorithmXxhash128,
-			},
-			want: true,
 		},
 	}
 	for _, tt := range tests {
@@ -1281,22 +1251,6 @@ func Test_checkChecksumTypeAndAlgo(t *testing.T) {
 			name: "composite-xxhash64",
 			args: args{
 				algo: types.ChecksumAlgorithmXxhash64,
-				t:    types.ChecksumTypeComposite,
-			},
-			wantErr: false,
-		},
-		{
-			name: "composite-xxhash3",
-			args: args{
-				algo: types.ChecksumAlgorithmXxhash3,
-				t:    types.ChecksumTypeComposite,
-			},
-			wantErr: false,
-		},
-		{
-			name: "composite-xxhash128",
-			args: args{
-				algo: types.ChecksumAlgorithmXxhash128,
 				t:    types.ChecksumTypeComposite,
 			},
 			wantErr: false,

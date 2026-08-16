@@ -42,7 +42,6 @@ import (
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/backend/meta"
 	"github.com/versity/versitygw/debuglogger"
-	"github.com/versity/versitygw/s3api/middlewares"
 	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -3248,7 +3247,7 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 	hash := md5.New()
 	tr := io.TeeReader(r, hash)
 
-	chRdr, chunkUpload := input.Body.(middlewares.ChecksumReader)
+	chRdr, chunkUpload := input.Body.(utils.ChecksumReader)
 	isTrailingChecksum := chunkUpload && chRdr.Algorithm() != ""
 
 	// user input checksum algorithm: either with chunk uploads or with request headers
@@ -3266,8 +3265,6 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 			{input.ChecksumSHA512, utils.HashTypeSha512},
 			{input.ChecksumMD5, utils.HashTypeMd5},
 			{input.ChecksumXXHASH64, utils.HashTypeXXHASH64},
-			{input.ChecksumXXHASH3, utils.HashTypeXXHASH3},
-			{input.ChecksumXXHASH128, utils.HashTypeXXHASH128},
 		}
 
 		for _, config := range hashConfigs {
@@ -3447,10 +3444,6 @@ func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPart
 				res.ChecksumMD5 = &sumToReturn
 			case utils.HashTypeXXHASH64:
 				res.ChecksumXXHASH64 = &sumToReturn
-			case utils.HashTypeXXHASH3:
-				res.ChecksumXXHASH3 = &sumToReturn
-			case utils.HashTypeXXHASH128:
-				res.ChecksumXXHASH128 = &sumToReturn
 			}
 		}
 	}
@@ -3826,7 +3819,7 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 		contentLength = *po.ContentLength
 	}
 
-	chRdr, chunkUpload := po.Body.(middlewares.ChecksumReader)
+	chRdr, chunkUpload := po.Body.(utils.ChecksumReader)
 	isTrailingChecksum := chunkUpload && chRdr.Algorithm() != ""
 
 	checksumAlgorithm := po.ChecksumAlgorithm
@@ -3845,8 +3838,6 @@ func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObje
 			{po.ChecksumSHA512, utils.HashTypeSha512},
 			{po.ChecksumMD5, utils.HashTypeMd5},
 			{po.ChecksumXXHASH64, utils.HashTypeXXHASH64},
-			{po.ChecksumXXHASH3, utils.HashTypeXXHASH3},
-			{po.ChecksumXXHASH128, utils.HashTypeXXHASH128},
 		}
 
 		for _, config := range hashConfigs {
@@ -5547,12 +5538,6 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 				case utils.HashTypeXXHASH64:
 					checksums.XXHASH64 = &sum
 					xxhash64 = &sum
-				case utils.HashTypeXXHASH3:
-					checksums.XXHASH3 = &sum
-					xxhash3 = &sum
-				case utils.HashTypeXXHASH128:
-					checksums.XXHASH128 = &sum
-					xxhash128 = &sum
 				}
 
 				// If a new checksum is calculated, the checksum type

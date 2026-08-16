@@ -435,8 +435,6 @@ func userPartChecksum(input *s3.UploadPartInput) (utils.HashType, string) {
 		{input.ChecksumSHA512, utils.HashTypeSha512},
 		{input.ChecksumMD5, utils.HashTypeMd5},
 		{input.ChecksumXXHASH64, utils.HashTypeXXHASH64},
-		{input.ChecksumXXHASH3, utils.HashTypeXXHASH3},
-		{input.ChecksumXXHASH128, utils.HashTypeXXHASH128},
 	} {
 		if c.v != nil && *c.v != "" {
 			return c.t, *c.v

@@ -12,7 +12,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package auth
+package providers
 
 import (
 	"context"
@@ -25,6 +25,7 @@ import (
 
 	vault "github.com/hashicorp/vault-client-go"
 	"github.com/hashicorp/vault-client-go/schema"
+	"github.com/versity/versitygw/auth"
 )
 
 const requestTimeout = 10 * time.Second
@@ -34,7 +35,7 @@ type VaultIAMService struct {
 	authReqOpts       []vault.RequestOption
 	kvReqOpts         []vault.RequestOption
 	secretStoragePath string
-	rootAcc           Account
+	rootAcc           auth.Account
 	creds             schema.AppRoleLoginRequest
 }
 
@@ -61,11 +62,11 @@ func resolveVaultNamespaces(authNamespace, secretStorageNamespace, fallback stri
 	return ns
 }
 
-var _ IAMService = &VaultIAMService{}
+var _ auth.IAMService = &VaultIAMService{}
 
-func NewVaultIAMService(rootAcc Account, endpoint, namespace, secretStoragePath, secretStorageNamespace,
+func NewVaultIAMService(rootAcc auth.Account, endpoint, namespace, secretStoragePath, secretStorageNamespace,
 	authMethod, authNamespace, mountPath, rootToken, roleID, roleSecret, serverCert,
-	clientCert, clientCertKey string) (IAMService, error) {
+	clientCert, clientCertKey string) (auth.IAMService, error) {
 	opts := []vault.ClientOption{
 		vault.WithAddress(endpoint),
 		vault.WithRequestTimeout(requestTimeout),
@@ -189,9 +190,9 @@ func (vt *VaultIAMService) reAuthIfNeeded(err error) error {
 	return nil
 }
 
-func (vt *VaultIAMService) CreateAccount(account Account) error {
+func (vt *VaultIAMService) CreateAccount(account auth.Account) error {
 	if vt.rootAcc.Access == account.Access {
-		return ErrUserExists
+		return auth.ErrUserExists
 	}
 	_, err := vt.client.Secrets.KvV2Write(context.Background(),
 		vt.secretStoragePath+"/"+account.Access, schema.KvV2WriteRequest{
@@ -204,7 +205,7 @@ func (vt *VaultIAMService) CreateAccount(account Account) error {
 		}, vt.kvReqOpts...)
 	if err != nil {
 		if strings.Contains(err.Error(), "check-and-set") {
-			return ErrUserExists
+			return auth.ErrUserExists
 		}
 
 		reauthErr := vt.reAuthIfNeeded(err)
@@ -223,7 +224,7 @@ func (vt *VaultIAMService) CreateAccount(account Account) error {
 			}, vt.kvReqOpts...)
 		if err != nil {
 			if strings.Contains(err.Error(), "check-and-set") {
-				return ErrUserExists
+				return auth.ErrUserExists
 			}
 			if vault.IsErrorStatus(err, http.StatusForbidden) {
 				return fmt.Errorf("vault 403 permission denied on path %q. check KV mount path and policy. original: %w",
@@ -236,7 +237,7 @@ func (vt *VaultIAMService) CreateAccount(account Account) error {
 	return nil
 }
 
-func (vt *VaultIAMService) GetUserAccount(access string) (Account, error) {
+func (vt *VaultIAMService) GetUserAccount(access string) (auth.Account, error) {
 	if vt.rootAcc.Access == access {
 		return vt.rootAcc, nil
 	}
@@ -245,28 +246,28 @@ func (vt *VaultIAMService) GetUserAccount(access string) (Account, error) {
 	if err != nil {
 		reauthErr := vt.reAuthIfNeeded(err)
 		if reauthErr != nil {
-			return Account{}, reauthErr
+			return auth.Account{}, reauthErr
 		}
 		// retry once after re-auth
 		resp, err = vt.client.Secrets.KvV2Read(context.Background(),
 			vt.secretStoragePath+"/"+access, vt.kvReqOpts...)
 		if err != nil {
-			return Account{}, err
+			return auth.Account{}, err
 		}
 	}
 	acc, err := parseVaultUserAccount(resp.Data.Data, access)
 	if err != nil {
-		return Account{}, err
+		return auth.Account{}, err
 	}
 	return acc, nil
 }
 
-func (vt *VaultIAMService) UpdateUserAccount(access string, props MutableProps) error {
+func (vt *VaultIAMService) UpdateUserAccount(access string, props auth.MutableProps) error {
 	acc, err := vt.GetUserAccount(access)
 	if err != nil {
 		return err
 	}
-	updateAcc(&acc, props)
+	auth.UpdateAcc(&acc, props)
 	err = vt.DeleteUserAccount(access)
 	if err != nil {
 		return err
@@ -296,14 +297,14 @@ func (vt *VaultIAMService) DeleteUserAccount(access string) error {
 	return nil
 }
 
-func (vt *VaultIAMService) ListUserAccounts() ([]Account, error) {
+func (vt *VaultIAMService) ListUserAccounts() ([]auth.Account, error) {
 	resp, err := vt.client.Secrets.KvV2List(context.Background(),
 		vt.secretStoragePath, vt.kvReqOpts...)
 	if err != nil {
 		reauthErr := vt.reAuthIfNeeded(err)
 		if reauthErr != nil {
 			if vault.IsErrorStatus(err, http.StatusNotFound) {
-				return []Account{}, nil
+				return []auth.Account{}, nil
 			}
 			return nil, reauthErr
 		}
@@ -312,12 +313,12 @@ func (vt *VaultIAMService) ListUserAccounts() ([]Account, error) {
 			vt.secretStoragePath, vt.kvReqOpts...)
 		if err != nil {
 			if vault.IsErrorStatus(err, http.StatusNotFound) {
-				return []Account{}, nil
+				return []auth.Account{}, nil
 			}
 			return nil, err
 		}
 	}
-	accs := []Account{}
+	accs := []auth.Account{}
 	for _, acss := range resp.Data.Keys {
 		acc, err := vt.GetUserAccount(acss)
 		if err != nil {
@@ -335,7 +336,7 @@ func (vt *VaultIAMService) Shutdown() error {
 
 var errInvalidUser error = errors.New("invalid user account entry in secrets engine")
 
-func parseVaultUserAccount(data map[string]any, access string) (acc Account, err error) {
+func parseVaultUserAccount(data map[string]any, access string) (acc auth.Account, err error) {
 	usrAcc, ok := data[access].(map[string]any)
 	if !ok {
 		return acc, errInvalidUser
@@ -378,10 +379,10 @@ func parseVaultUserAccount(data map[string]any, access string) (acc Account, err
 		return acc, errInvalidUser
 	}
 
-	return Account{
+	return auth.Account{
 		Access:    acss,
 		Secret:    secret,
-		Role:      Role(role),
+		Role:      auth.Role(role),
 		UserID:    int(userId),
 		GroupID:   int(groupId),
 		ProjectID: int(projectID),

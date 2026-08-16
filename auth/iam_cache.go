@@ -72,7 +72,7 @@ func (i *icache) update(k string, props MutableProps) {
 
 	item, found := i.items[k]
 	if found {
-		updateAcc(&item.value, props)
+		UpdateAcc(&item.value, props)
 
 		// refresh the expiration date
 		item.exp = time.Now().Add(i.expire)
