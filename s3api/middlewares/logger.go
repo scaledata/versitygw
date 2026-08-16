@@ -16,14 +16,13 @@ package middlewares
 
 import (
 	"github.com/gofiber/fiber/v3"
-	"github.com/versity/versitygw/debuglogger"
 )
 
 func DebugLogger() fiber.Handler {
 	return func(ctx fiber.Ctx) error {
-		debuglogger.LogFiberRequestDetails(ctx)
+		LogFiberRequestDetails(ctx)
 		err := ctx.Next()
-		debuglogger.LogFiberResponseDetails(ctx)
+		LogFiberResponseDetails(ctx)
 		return err
 	}
 }
