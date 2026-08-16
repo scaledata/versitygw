@@ -32,7 +32,6 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/versity/versitygw/debuglogger"
 	"github.com/versity/versitygw/s3err"
-	"github.com/zeebo/xxh3"
 )
 
 // HashType identifies the checksum algorithm to be used
@@ -59,10 +58,12 @@ const (
 	HashTypeCRC64NVME HashType = "crc64nvme"
 	// HashTypeXXHASH64 generates XXHASH64 Base64-Encoded checksum for the data stream
 	HashTypeXXHASH64 HashType = "xxhash64"
-	// HashTypeXXHASH3 generates XXHASH3 Base64-Encoded checksum for the data stream
-	HashTypeXXHASH3 HashType = "xxhash3"
-	// HashTypeXXHASH128 generates XXHASH128 Base64-Encoded checksum for the data stream
-	HashTypeXXHASH128 HashType = "xxhash128"
+	// XXHASH3 and XXHASH128 are deliberately not supported: a client
+	// requesting either gets a clean InvalidRequest rather than a
+	// server-side failure. Not a protocol requirement -- AWS S3's default
+	// checksum algorithm is CRC32, and XXH3/XXH128 only apply when a
+	// client explicitly opts in. Revisit if Otter needs to interoperate
+	// with a client that does.
 	// HashTypeNone is a no-op checksum for the data stream
 	HashTypeNone HashType = "none"
 )
@@ -107,10 +108,6 @@ func NewHashReader(r io.Reader, expectedSum string, ht HashType) (*HashReader, e
 		hash = crc64.New(crc64NVMETable)
 	case HashTypeXXHASH64:
 		hash = xxhash.New()
-	case HashTypeXXHASH3:
-		hash = xxh3.New()
-	case HashTypeXXHASH128:
-		hash = xxh3.New128()
 	case HashTypeNone:
 		hash = noop{}
 	default:
@@ -191,16 +188,6 @@ func (hr *HashReader) Read(p []byte) (int, error) {
 			if sum != hr.sum {
 				return n, s3err.GetChecksumBadDigestErr(types.ChecksumAlgorithmXxhash64)
 			}
-		case HashTypeXXHASH3:
-			sum := hr.Sum()
-			if sum != hr.sum {
-				return n, s3err.GetChecksumBadDigestErr(types.ChecksumAlgorithmXxhash3)
-			}
-		case HashTypeXXHASH128:
-			sum := hr.Sum()
-			if sum != hr.sum {
-				return n, s3err.GetChecksumBadDigestErr(types.ChecksumAlgorithmXxhash128)
-			}
 		default:
 			return n, errInvalidHashType
 		}
@@ -241,10 +228,6 @@ func (hr *HashReader) Sum() string {
 	case HashTypeCRC64NVME:
 		return Base64SumString(hr.hash.Sum(nil))
 	case HashTypeXXHASH64:
-		return Base64SumString(hr.hash.Sum(nil))
-	case HashTypeXXHASH3:
-		return Base64SumString(hr.hash.Sum(nil))
-	case HashTypeXXHASH128:
 		return Base64SumString(hr.hash.Sum(nil))
 	default:
 		return ""
@@ -383,8 +366,6 @@ func AddCRCChecksum(algo types.ChecksumAlgorithm, crc, partCrc string, partLen i
 // - SHA512
 // - MD5
 // - XXHASH64
-// - XXHASH3
-// - XXHASH128
 func NewCompositeChecksumReader(ht HashType) (*CompositeChecksumReader, error) {
 	var hasher hash.Hash
 	switch ht {
@@ -402,10 +383,6 @@ func NewCompositeChecksumReader(ht HashType) (*CompositeChecksumReader, error) {
 		hasher = crc32.New(crc32.MakeTable(crc32.Castagnoli))
 	case HashTypeXXHASH64:
 		hasher = xxhash.New()
-	case HashTypeXXHASH3:
-		hasher = xxh3.New()
-	case HashTypeXXHASH128:
-		hasher = xxh3.New128()
 	case HashTypeNone:
 		hasher = noop{}
 	default:

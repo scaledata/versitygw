@@ -12,7 +12,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package auth
+package providers
 
 import (
 	"bytes"
@@ -33,6 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/debuglogger"
 )
 
@@ -40,7 +41,7 @@ import (
 // The endpoint, credentials, bucket, and region are provided
 // from cli configuration.
 // The object format and name is the same as the internal IAM service:
-// coming from iAMConfig and iamFile in iam_internal.
+// coming from auth.IAMConfig and auth.IAMFile in iam_internal.
 
 type IAMServiceS3 struct {
 	// This mutex will help with racing updates to the IAM data
@@ -57,13 +58,13 @@ type IAMServiceS3 struct {
 	bucket        string
 	endpoint      string
 	sslSkipVerify bool
-	rootAcc       Account
+	rootAcc       auth.Account
 	client        *s3.Client
 }
 
-var _ IAMService = &IAMServiceS3{}
+var _ auth.IAMService = &IAMServiceS3{}
 
-func NewS3(rootAcc Account, access, secret, region, bucket, endpoint string, sslSkipVerify bool) (*IAMServiceS3, error) {
+func NewS3(rootAcc auth.Account, access, secret, region, bucket, endpoint string, sslSkipVerify bool) (*IAMServiceS3, error) {
 	if access == "" {
 		return nil, fmt.Errorf("must provide s3 IAM service access key")
 	}
@@ -106,9 +107,9 @@ func NewS3(rootAcc Account, access, secret, region, bucket, endpoint string, ssl
 	return i, nil
 }
 
-func (s *IAMServiceS3) CreateAccount(account Account) error {
+func (s *IAMServiceS3) CreateAccount(account auth.Account) error {
 	if s.rootAcc.Access == account.Access {
-		return ErrUserExists
+		return auth.ErrUserExists
 	}
 
 	s.Lock()
@@ -121,14 +122,14 @@ func (s *IAMServiceS3) CreateAccount(account Account) error {
 
 	_, ok := conf.AccessAccounts[account.Access]
 	if ok {
-		return ErrUserExists
+		return auth.ErrUserExists
 	}
 	conf.AccessAccounts[account.Access] = account
 
 	return s.storeAccts(conf)
 }
 
-func (s *IAMServiceS3) GetUserAccount(access string) (Account, error) {
+func (s *IAMServiceS3) GetUserAccount(access string) (auth.Account, error) {
 	if access == s.rootAcc.Access {
 		return s.rootAcc, nil
 	}
@@ -138,18 +139,18 @@ func (s *IAMServiceS3) GetUserAccount(access string) (Account, error) {
 
 	conf, err := s.getAccounts()
 	if err != nil {
-		return Account{}, err
+		return auth.Account{}, err
 	}
 
 	acct, ok := conf.AccessAccounts[access]
 	if !ok {
-		return Account{}, ErrNoSuchUser
+		return auth.Account{}, auth.ErrNoSuchUser
 	}
 
 	return acct, nil
 }
 
-func (s *IAMServiceS3) UpdateUserAccount(access string, props MutableProps) error {
+func (s *IAMServiceS3) UpdateUserAccount(access string, props auth.MutableProps) error {
 	s.Lock()
 	defer s.Unlock()
 
@@ -160,10 +161,10 @@ func (s *IAMServiceS3) UpdateUserAccount(access string, props MutableProps) erro
 
 	acc, ok := conf.AccessAccounts[access]
 	if !ok {
-		return ErrNoSuchUser
+		return auth.ErrNoSuchUser
 	}
 
-	updateAcc(&acc, props)
+	auth.UpdateAcc(&acc, props)
 	conf.AccessAccounts[access] = acc
 
 	return s.storeAccts(conf)
@@ -187,7 +188,7 @@ func (s *IAMServiceS3) DeleteUserAccount(access string) error {
 	return s.storeAccts(conf)
 }
 
-func (s *IAMServiceS3) ListUserAccounts() ([]Account, error) {
+func (s *IAMServiceS3) ListUserAccounts() ([]auth.Account, error) {
 	s.RLock()
 	defer s.RUnlock()
 
@@ -202,9 +203,9 @@ func (s *IAMServiceS3) ListUserAccounts() ([]Account, error) {
 	}
 	sort.Strings(keys)
 
-	var accs []Account
+	var accs []auth.Account
 	for _, k := range keys {
-		accs = append(accs, Account{
+		accs = append(accs, auth.Account{
 			Access:    k,
 			Secret:    conf.AccessAccounts[k].Secret,
 			Role:      conf.AccessAccounts[k].Role,
@@ -243,8 +244,8 @@ func (s *IAMServiceS3) getConfig() (aws.Config, error) {
 	return config.LoadDefaultConfig(context.Background(), opts...)
 }
 
-func (s *IAMServiceS3) getAccounts() (iAMConfig, error) {
-	obj := iamFile
+func (s *IAMServiceS3) getAccounts() (auth.IAMConfig, error) {
+	obj := auth.IAMFile
 
 	out, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
 		Bucket: &s.bucket,
@@ -255,41 +256,41 @@ func (s *IAMServiceS3) getAccounts() (iAMConfig, error) {
 		// init empty accounts struct and return that
 		var nsk *types.NoSuchKey
 		if errors.As(err, &nsk) {
-			return iAMConfig{AccessAccounts: map[string]Account{}}, nil
+			return auth.IAMConfig{AccessAccounts: map[string]auth.Account{}}, nil
 		}
 		var apiErr smithy.APIError
 		if errors.As(err, &apiErr) {
 			if apiErr.ErrorCode() == "NotFound" {
-				return iAMConfig{AccessAccounts: map[string]Account{}}, nil
+				return auth.IAMConfig{AccessAccounts: map[string]auth.Account{}}, nil
 			}
 		}
 
 		// all other errors, return the error
-		return iAMConfig{}, fmt.Errorf("get %v: %w", obj, err)
+		return auth.IAMConfig{}, fmt.Errorf("get %v: %w", obj, err)
 	}
 
 	defer out.Body.Close()
 
 	b, err := io.ReadAll(out.Body)
 	if err != nil {
-		return iAMConfig{}, fmt.Errorf("read %v: %w", obj, err)
+		return auth.IAMConfig{}, fmt.Errorf("read %v: %w", obj, err)
 	}
 
-	conf, err := parseIAM(b)
+	conf, err := auth.ParseIAM(b)
 	if err != nil {
-		return iAMConfig{}, fmt.Errorf("parse iam data: %w", err)
+		return auth.IAMConfig{}, fmt.Errorf("parse iam data: %w", err)
 	}
 
 	return conf, nil
 }
 
-func (s *IAMServiceS3) storeAccts(conf iAMConfig) error {
+func (s *IAMServiceS3) storeAccts(conf auth.IAMConfig) error {
 	b, err := json.Marshal(conf)
 	if err != nil {
 		return fmt.Errorf("failed to serialize iam: %w", err)
 	}
 
-	obj := iamFile
+	obj := auth.IAMFile
 	uploader := transfermanager.New(s.client)
 	upinfo := &transfermanager.UploadObjectInput{
 		Body:   bytes.NewReader(b),
@@ -298,7 +299,7 @@ func (s *IAMServiceS3) storeAccts(conf iAMConfig) error {
 	}
 	_, err = uploader.UploadObject(context.Background(), upinfo)
 	if err != nil {
-		return fmt.Errorf("store accounts in %v: %w", iamFile, err)
+		return fmt.Errorf("store accounts in %v: %w", auth.IAMFile, err)
 	}
 
 	return nil

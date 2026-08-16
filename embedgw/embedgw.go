@@ -34,6 +34,7 @@ import (
 	"sync/atomic"
 
 	"github.com/versity/versitygw/auth"
+	"github.com/versity/versitygw/auth/providers"
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/debuglogger"
 	"github.com/versity/versitygw/metrics"
@@ -634,7 +635,7 @@ func RunVersityGW(ctx context.Context, be backend.Backend, cfg *Config) error {
 		debuglogger.SetIAMDebugEnabled()
 	}
 
-	iam, err := auth.New(&auth.Opts{
+	iam, err := providers.New(&auth.Opts{
 		RootAccount: auth.Account{
 			Access: cfg.RootUserAccess,
 			Secret: cfg.RootUserSecret,

@@ -12,7 +12,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package auth
+package providers
 
 import (
 	"crypto/tls"
@@ -24,6 +24,7 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-ldap/ldap/v3"
+	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/debuglogger"
 )
 
@@ -37,7 +38,7 @@ type LdapIAMService struct {
 	groupIdAtr    string
 	userIdAtr     string
 	projectIdAtr  string
-	rootAcc       Account
+	rootAcc       auth.Account
 	url           string
 	bindDN        string
 	pass          string
@@ -45,9 +46,9 @@ type LdapIAMService struct {
 	mu            sync.Mutex
 }
 
-var _ IAMService = &LdapIAMService{}
+var _ auth.IAMService = &LdapIAMService{}
 
-func NewLDAPService(rootAcc Account, ldapURL, bindDN, pass, queryBase, accAtr, secAtr, roleAtr, userIdAtr, groupIdAtr, projectIdAtr, objClasses string, tlsSkipVerify bool) (IAMService, error) {
+func NewLDAPService(rootAcc auth.Account, ldapURL, bindDN, pass, queryBase, accAtr, secAtr, roleAtr, userIdAtr, groupIdAtr, projectIdAtr, objClasses string, tlsSkipVerify bool) (auth.IAMService, error) {
 	if ldapURL == "" || bindDN == "" || pass == "" || queryBase == "" || accAtr == "" ||
 		secAtr == "" || roleAtr == "" || userIdAtr == "" || groupIdAtr == "" || projectIdAtr == "" || objClasses == "" {
 		return nil, fmt.Errorf("required parameters list not fully provided")
@@ -133,9 +134,9 @@ func (ld *LdapIAMService) execute(f func(*ldap.Conn) error) error {
 	return err
 }
 
-func (ld *LdapIAMService) CreateAccount(account Account) error {
+func (ld *LdapIAMService) CreateAccount(account auth.Account) error {
 	if ld.rootAcc.Access == account.Access {
-		return ErrUserExists
+		return auth.ErrUserExists
 	}
 	userEntry := ldap.NewAddRequest(fmt.Sprintf("%v=%v,%v", ld.accessAtr, account.Access, ld.queryBase), nil)
 	userEntry.Attribute("objectClass", ld.objClasses)
@@ -167,7 +168,7 @@ func (ld *LdapIAMService) buildSearchFilter(access string) string {
 	return fmt.Sprintf("(&%v)", searchFilter.String())
 }
 
-func (ld *LdapIAMService) GetUserAccount(access string) (Account, error) {
+func (ld *LdapIAMService) GetUserAccount(access string) (auth.Account, error) {
 	if access == ld.rootAcc.Access {
 		return ld.rootAcc, nil
 	}
@@ -201,41 +202,41 @@ func (ld *LdapIAMService) GetUserAccount(access string) (Account, error) {
 	}
 
 	if err != nil {
-		return Account{}, err
+		return auth.Account{}, err
 	}
 
 	if len(result.Entries) == 0 {
-		return Account{}, ErrNoSuchUser
+		return auth.Account{}, auth.ErrNoSuchUser
 	}
 
 	entry := result.Entries[0]
 	groupId, err := strconv.Atoi(entry.GetAttributeValue(ld.groupIdAtr))
 	if err != nil {
-		return Account{}, fmt.Errorf("invalid entry value for group-id %q: %w",
+		return auth.Account{}, fmt.Errorf("invalid entry value for group-id %q: %w",
 			entry.GetAttributeValue(ld.groupIdAtr), err)
 	}
 	userId, err := strconv.Atoi(entry.GetAttributeValue(ld.userIdAtr))
 	if err != nil {
-		return Account{}, fmt.Errorf("invalid entry value for user-id %q: %w",
+		return auth.Account{}, fmt.Errorf("invalid entry value for user-id %q: %w",
 			entry.GetAttributeValue(ld.userIdAtr), err)
 	}
 	projectID, err := strconv.Atoi(entry.GetAttributeValue(ld.projectIdAtr))
 	if err != nil {
-		return Account{}, fmt.Errorf("invalid entry value for project-id %q: %w",
+		return auth.Account{}, fmt.Errorf("invalid entry value for project-id %q: %w",
 			entry.GetAttributeValue(ld.projectIdAtr), err)
 	}
 
-	return Account{
+	return auth.Account{
 		Access:    entry.GetAttributeValue(ld.accessAtr),
 		Secret:    entry.GetAttributeValue(ld.secretAtr),
-		Role:      Role(entry.GetAttributeValue(ld.roleAtr)),
+		Role:      auth.Role(entry.GetAttributeValue(ld.roleAtr)),
 		GroupID:   groupId,
 		UserID:    userId,
 		ProjectID: projectID,
 	}, nil
 }
 
-func (ld *LdapIAMService) UpdateUserAccount(access string, props MutableProps) error {
+func (ld *LdapIAMService) UpdateUserAccount(access string, props auth.MutableProps) error {
 	req := ldap.NewModifyRequest(fmt.Sprintf("%v=%v, %v", ld.accessAtr, access, ld.queryBase), nil)
 	if props.Secret != nil {
 		req.Replace(ld.secretAtr, []string{*props.Secret})
@@ -276,7 +277,7 @@ func (ld *LdapIAMService) DeleteUserAccount(access string) error {
 	return nil
 }
 
-func (ld *LdapIAMService) ListUserAccounts() ([]Account, error) {
+func (ld *LdapIAMService) ListUserAccounts() ([]auth.Account, error) {
 	var resp *ldap.SearchResult
 	searchRequest := ldap.NewSearchRequest(
 		ld.queryBase,
@@ -299,7 +300,7 @@ func (ld *LdapIAMService) ListUserAccounts() ([]Account, error) {
 		return nil, err
 	}
 
-	result := []Account{}
+	result := []auth.Account{}
 	for _, el := range resp.Entries {
 		groupId, err := strconv.Atoi(el.GetAttributeValue(ld.groupIdAtr))
 		if err != nil {
@@ -317,10 +318,10 @@ func (ld *LdapIAMService) ListUserAccounts() ([]Account, error) {
 				el.GetAttributeValue(ld.groupIdAtr), err)
 		}
 
-		result = append(result, Account{
+		result = append(result, auth.Account{
 			Access:    el.GetAttributeValue(ld.accessAtr),
 			Secret:    el.GetAttributeValue(ld.secretAtr),
-			Role:      Role(el.GetAttributeValue(ld.roleAtr)),
+			Role:      auth.Role(el.GetAttributeValue(ld.roleAtr)),
 			GroupID:   groupId,
 			ProjectID: projectID,
 			UserID:    userId,
