@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+// OtterControlService — the JFL -> Otter gateway control-plane RPC, over gRPC.
+//
+// This is the standalone (laptop-buildable) contract for the receiver loopback test.
+// It mirrors the proven Thrift OtterControl wire (poc0-jfl-thrift) so the grant
+// subsystem (otter/grant) is exercised UNCHANGED under a gRPC transport. The
+// production shape under src/grpc/core/otter adds core.common.RequestContext on
+// requests and core.common.ErrorMessageInfo on responses (CDM convention) — omitted
+// here exactly as the Thrift PoC omitted RequestContext.
+package otter.control.v1;
+
+option go_package = "github.com/versity/versitygw/otter/controlgrpc/ottercontrolpb;ottercontrolpb";
+
+enum PlacementPolicy {
+  KEY_HASH = 0;
+  ORDINAL_ROUND_ROBIN = 1;
+}
+
+message ChannelSlot {
+  int32  slot = 1;
+  string node_id = 2;
+  string endpoint = 3;
+  string channel_path = 4;
+}
+
+// The grant: "which client (by access key), which bucket, which channels."
+message OtterChannelGrant {
+  string client_id = 1;             // logical client (IAM principal) — provenance only
+  string access_key_id = 2;         // SigV4 key the client signs with -> the join key
+  string bucket = 3;                // the bucket this grant authorizes
+  int64  epoch = 4;                 // monotonic version, frozen per (access_key_id,bucket); higher wins
+  int32  n = 5;                     // channel count (== slots.size; validated on receipt)
+  repeated ChannelSlot slots = 6;   // ordered slot -> owner: the channel-set
+  PlacementPolicy policy = 7;       // KEY_HASH | ORDINAL_ROUND_ROBIN
+  int64  lease_expiry_unix_s = 8;   // optional TTL (revoke-by-expiry); 0 = none
+  bool   active = 9;                // false = soft-disable
+}
+
+message PingRequest { string caller = 1; }
+message PingResponse {
+  string message = 1;
+  int64  server_unix_ms = 2;
+}
+
+message UpsertChannelGrantRequest { OtterChannelGrant grant = 1; }
+message UpsertChannelGrantResponse {
+  bool   accepted = 1;              // false if an equal-or-newer epoch already won
+  int64  current_epoch = 2;         // the epoch now in effect (== grant.epoch on accept; the winner on reject)
+  string detail = 3;
+}
+
+// Revoke is keyed by the access_key_id (Otter's join key), not client_id.
+message RevokeChannelGrantRequest {
+  string access_key_id = 1;
+  string bucket = 2;
+  int64  epoch = 3;                 // guard: only revoke if >= the cached epoch
+  string client_id = 4;             // provenance (optional)
+}
+message RevokeChannelGrantResponse {
+  bool   revoked = 1;
+  string detail = 2;
+}
+
+service OtterControlService {
+  // liveness / mTLS-handshake probe
+  rpc Ping(PingRequest) returns (PingResponse);
+  // JFL pushes a grant; idempotent by (access_key_id, bucket); epoch guards ordering
+  rpc UpsertChannelGrant(UpsertChannelGrantRequest) returns (UpsertChannelGrantResponse);
+  // offboard / rotate / retire a grant from the hot cache
+  rpc RevokeChannelGrant(RevokeChannelGrantRequest) returns (RevokeChannelGrantResponse);
+}
