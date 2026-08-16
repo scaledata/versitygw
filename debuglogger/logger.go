@@ -16,13 +16,9 @@ package debuglogger
 
 import (
 	"fmt"
-	"log"
-	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
-
-	"github.com/gofiber/fiber/v3"
 )
 
 type Color string
@@ -60,53 +56,6 @@ func InternalError(er error) {
 
 func printError(prefix prefix, er error) {
 	fmt.Fprintf(os.Stderr, string(red)+string(prefix)+"%v"+reset+"\n", er)
-}
-
-// Logs http request details: headers, body, params, query args
-func LogFiberRequestDetails(ctx fiber.Ctx) {
-	// Log the full request url
-	fullURL := ctx.Scheme() + "://" + ctx.Host() + ctx.OriginalURL()
-	fmt.Printf("%s[URL]: %s%s\n", green, fullURL, reset)
-
-	// log request headers
-	wrapInBox(green, "REQUEST HEADERS", boxWidth, func() {
-		for key, value := range ctx.Request().Header.All() {
-			printWrappedLine(yellow, string(key), string(value))
-		}
-	})
-	// skip request body log for PutObject and UploadPart
-	skipBodyLog := isLargeDataAction(ctx)
-	if !skipBodyLog {
-		body := ctx.Request().Body()
-		if len(body) != 0 {
-			printBoxTitleLine(blue, "REQUEST BODY", boxWidth, false)
-			fmt.Printf("%s%s%s\n", blue, body, reset)
-			printHorizontalBorder(blue, boxWidth, false)
-		}
-	}
-
-	if ctx.Request().URI().QueryArgs().Len() != 0 {
-		for key, value := range ctx.Request().URI().QueryArgs().All() {
-			log.Printf("%s: %s", key, value)
-		}
-	}
-}
-
-// Logs http response details: body, headers
-func LogFiberResponseDetails(ctx fiber.Ctx) {
-	wrapInBox(green, "RESPONSE HEADERS", boxWidth, func() {
-		for key, value := range ctx.Response().Header.All() {
-			printWrappedLine(yellow, string(key), string(value))
-		}
-	})
-
-	_, ok := ctx.Locals("skip-res-body-log").(bool)
-	if !ok {
-		body := ctx.Response().Body()
-		if len(body) != 0 {
-			PrintInsideHorizontalBorders(blue, "RESPONSE BODY", string(body), boxWidth)
-		}
-	}
 }
 
 var debugEnabled atomic.Bool
@@ -343,26 +292,4 @@ func wrapText(text string, width int) []string {
 		lines = append(lines, text)
 	}
 	return lines
-}
-
-// TODO: remove this and use utils.IsBidDataAction after refactoring
-// and creating 'internal' package
-func isLargeDataAction(ctx fiber.Ctx) bool {
-	pathParts := strings.Split(ctx.Path(), "/")
-
-	// PutObject and UploadPart
-	if ctx.Method() == http.MethodPut && len(pathParts) >= 3 {
-		if !ctx.Request().URI().QueryArgs().Has("tagging") && ctx.Get("X-Amz-Copy-Source") == "" && !ctx.Request().URI().QueryArgs().Has("acl") {
-			return true
-		}
-	}
-
-	isBucketAction := (len(pathParts) == 3 && pathParts[2] == "") || (len(pathParts) == 2 && pathParts[1] != "")
-
-	// POST object action
-	if isBucketAction && ctx.Method() == http.MethodPost {
-		return true
-	}
-
-	return false
 }
