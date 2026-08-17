@@ -31,9 +31,10 @@ import (
 )
 
 var (
-	ownerMapFile   string
-	selfIdxFlag    int
-	forwardTimeout time.Duration
+	ownerMapFile    string
+	selfIdxFlag     int
+	forwardTimeout  time.Duration
+	chanParallelism int
 
 	// af2Warm* flags enable WarmCache at startup: pre-populate the Af2Desc
 	// metadata cache from af2GetPartitionMetadata so GET/HEAD returns correct
@@ -77,6 +78,13 @@ as the argument and the shared owner map via --owner-map.`,
 				EnvVars:     []string{"OTTER_FORWARD_TIMEOUT"},
 				Value:       30 * time.Second,
 				Destination: &forwardTimeout,
+			},
+			&cli.IntFlag{
+				Name:        "chan-parallelism",
+				Usage:       "P: max concurrent byte-writes admitted into the local AF2 channel (1 = historical serialize-everything; >1 relaxes it to test throughput)",
+				EnvVars:     []string{"OTTER_CHAN_PARALLELISM"},
+				Value:       1,
+				Destination: &chanParallelism,
 			},
 			// posix/AF2 flags for the local channel (subset of `posix`):
 			&cli.BoolFlag{
@@ -307,7 +315,7 @@ func runOtter(ctx *cli.Context) error {
 		peers[i] = pxy
 	}
 
-	r, err := router.New(local, peers, om, selfIdxFlag, forwardTimeout)
+	r, err := router.New(local, peers, om, selfIdxFlag, forwardTimeout, chanParallelism)
 	if err != nil {
 		return err
 	}

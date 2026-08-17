@@ -69,7 +69,7 @@ func TestNewValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := New(tc.local, tc.peers, m, tc.selfIdx, 0)
+			_, err := New(tc.local, tc.peers, m, tc.selfIdx, 0, 1)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("New err=%v, wantErr=%v", err, tc.wantErr)
 			}
@@ -83,7 +83,7 @@ func TestCreateBucketFanOutAndEcho(t *testing.T) {
 	// Fresh local create fans out to both peers.
 	local := &fakeBucketBackend{}
 	p1, p2 := &fakeBucketBackend{}, &fakeBucketBackend{}
-	r, err := New(local, []backend.Backend{local, p1, p2}, m, 0, 0)
+	r, err := New(local, []backend.Backend{local, p1, p2}, m, 0, 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestCreateBucketFanOutAndEcho(t *testing.T) {
 	// at a node that already has the bucket — it must NOT re-fan.
 	echoLocal := &fakeBucketBackend{createErr: s3err.GetAPIError(s3err.ErrBucketAlreadyExists)}
 	q1, q2 := &fakeBucketBackend{}, &fakeBucketBackend{}
-	er, err := New(echoLocal, []backend.Backend{echoLocal, q1, q2}, m, 0, 0)
+	er, err := New(echoLocal, []backend.Backend{echoLocal, q1, q2}, m, 0, 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

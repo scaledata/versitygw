@@ -25,7 +25,7 @@ func TestReconfigureRaceClean(t *testing.T) {
 	be2 := &reconfigureTestBackend{id: 2}
 
 	om := &OwnerMap{N: 1, Epoch: 0, Slots: []Slot{{Slot: 0}}}
-	r, err := New(be1, []backend.Backend{nil}, om, 0, 0)
+	r, err := New(be1, []backend.Backend{nil}, om, 0, 0, 1)
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestReconfigureShutsDownReplaced(t *testing.T) {
 	oldBE := &shutdownRecorder{}
 	newBE := &shutdownRecorder{}
 	om := &OwnerMap{N: 1, Epoch: 0, Slots: []Slot{{Slot: 0}}}
-	r, err := New(oldBE, []backend.Backend{nil}, om, 0, 0)
+	r, err := New(oldBE, []backend.Backend{nil}, om, 0, 0, 1)
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestReconfigureValidation(t *testing.T) {
 	be := &reconfigureTestBackend{id: 1}
 	peer := &reconfigureTestBackend{id: 2}
 	om := &OwnerMap{N: 1, Epoch: 0, Slots: []Slot{{Slot: 0}}}
-	r, err := New(be, []backend.Backend{nil}, om, 0, 0)
+	r, err := New(be, []backend.Backend{nil}, om, 0, 0, 1)
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}

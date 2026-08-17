@@ -49,7 +49,8 @@ type routerCfg struct {
 type Router struct {
 	cfg            atomic.Pointer[routerCfg]
 	epoch          int64
-	chanSem        chan struct{} // weight-1: at most one byte-write into the local channel at a time
+	chanSem        chan struct{} // weight-P: at most P concurrent byte-writes into the local channel
+	chanP          int           // capacity of chanSem (the P in "P per channel"); >=1
 	forwardTimeout time.Duration // deadline for a forwarded byte-write (0 = no timeout)
 }
 
@@ -82,13 +83,22 @@ func validateCfg(local backend.Backend, peers []backend.Backend, selfIdx, n int)
 // peers must have length m.N; peers[selfIdx] is ignored (this node's objects are
 // written through local), and every other entry must be a forwarding backend to
 // that slot's gateway. forwardTimeout bounds a forwarded byte-write (0 disables).
-func New(local backend.Backend, peers []backend.Backend, m *OwnerMap, selfIdx int, forwardTimeout time.Duration) (*Router, error) {
+// chanParallelism is the P in "P per channel": the max number of concurrent
+// byte-writes admitted into the local AF2 channel. P=1 is the historical
+// serialize-everything invariant (wedge avoidance); P>1 relaxes it so multiple
+// parts of the same object (or writes to distinct objects on the same channel)
+// proceed concurrently. A value <1 is clamped to 1.
+func New(local backend.Backend, peers []backend.Backend, m *OwnerMap, selfIdx int, forwardTimeout time.Duration, chanParallelism int) (*Router, error) {
 	if err := validateCfg(local, peers, selfIdx, m.N); err != nil {
 		return nil, err
 	}
+	if chanParallelism < 1 {
+		chanParallelism = 1
+	}
 	r := &Router{
 		epoch:          m.Epoch,
-		chanSem:        make(chan struct{}, 1),
+		chanSem:        make(chan struct{}, chanParallelism),
+		chanP:          chanParallelism,
 		forwardTimeout: forwardTimeout,
 	}
 	r.cfg.Store(&routerCfg{
@@ -122,20 +132,33 @@ func (r *Router) Reconfigure(ctx context.Context, newLocal backend.Backend, newP
 		return err
 	}
 
-	// Drain in-flight local byte-writes (P=1) before swapping, but bound the
-	// wait: a wedged local backend is the likely reason for a regrant, and an
-	// unbounded acquire here would hang the very handoff meant to move traffic
-	// off the unhealthy node. NOTE: acquiring chanSem does not by itself close
-	// the pick()-before-enterWrite() window that can still land a stale write on
-	// the old backend — that is tracked separately; this only bounds the wait.
+	// Drain in-flight local byte-writes before swapping, but bound the wait: a
+	// wedged local backend is the likely reason for a regrant, and an unbounded
+	// acquire here would hang the very handoff meant to move traffic off the
+	// unhealthy node. With P>1 we must acquire ALL P tokens to fully quiesce the
+	// channel, not just one, else a concurrent in-flight write survives the swap.
+	// NOTE: acquiring chanSem does not by itself close the pick()-before-
+	// enterWrite() window that can still land a stale write on the old backend —
+	// that is tracked separately; this only bounds the wait.
 	dctx, cancel := context.WithTimeout(ctx, reconfigureDrainTimeout)
 	defer cancel()
-	select {
-	case r.chanSem <- struct{}{}:
-		defer func() { <-r.chanSem }()
-	case <-dctx.Done():
-		return fmt.Errorf("router: reconfigure timed out draining in-flight local write: %w", dctx.Err())
+	acquired := 0
+	for acquired < r.chanP {
+		select {
+		case r.chanSem <- struct{}{}:
+			acquired++
+		case <-dctx.Done():
+			for i := 0; i < acquired; i++ { // release what we took so writes can resume
+				<-r.chanSem
+			}
+			return fmt.Errorf("router: reconfigure timed out draining in-flight local writes: %w", dctx.Err())
+		}
 	}
+	defer func() {
+		for i := 0; i < r.chanP; i++ {
+			<-r.chanSem
+		}
+	}()
 
 	old := r.cfg.Load()
 	r.cfg.Store(&routerCfg{
